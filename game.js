@@ -1,125 +1,146 @@
 /* ============================================================================
    AR KLONDIKE SOLITAIRE — game.js
    ============================================================================
-   Architecture overview (useful for your report):
-
-   1. CARD MODEL      — plain JS objects {suit, rank, rankValue, color,
-                         faceUp, location, el, frontEl, backEl}. There is no
-                         3D engine state duplicated anywhere else; the arrays
-                         below (tableau/stock/waste/foundations) are the
-                         single source of truth for the game, and renderBoard()
-                         is the only place that pushes that state out to the
-                         3D scene.
-
-   2. 3D CARDS        — each card is an <a-entity> "wrapper" with two
-                         <a-plane> children (front + back). The wrapper's
-                         Y rotation is toggled between 0° (front facing the
-                         camera) and 180° (back facing the camera) to
-                         represent face-up / face-down — this is exactly the
-                         technique the original index.html used to flip the
-                         sample glTF card, just applied to two flat planes.
-
-   3. TEXTURES        — card faces are generated at runtime onto <canvas>
-                         elements and uploaded to three.js as CanvasTextures.
-                         This means the game works with zero external image
-                         assets. See CONFIG + getFrontTexture/getBackTexture
-                         for the one place to swap in your own artwork.
-
-   4. COORDINATE SPACE — all positions are in the local space of the MindAR
-                         image-target entity, i.e. "meters" relative to the
-                         size of your printed marker. X = right, Y = up the
-                         page, Z = out of the page toward the camera. Cards
-                         stacked in the same pile are given tiny increasing
-                         Z offsets so the raycaster (and your eyes) always
-                         pick the top card first.
-
-   5. INTERACTION      — "tap-to-select, tap-to-move". A single global
-                         `selected` variable holds the currently lifted
-                         card/run. Every clickable object (card faces + the
-                         empty "pile slot" markers) has its own click
-                         listener that resolves to either onCardClicked() or
-                         handlePileClick().
+   Single-Mesh Card Architecture:
+   - Exactly ONE <a-plane> entity per card with THREE.DoubleSide material.
+   - Textures swap dynamically on that single mesh when card.faceUp changes.
+   - No two-plane wrappers, no 180° rotations, no Z-fighting or plane bleeding.
+   - Elevation base BOARD_Z = 0.015 ensures cards never clip into the target image.
+   - CARD_Z_STEP = 0.008 with mesh.renderOrder = layer + 1 for deterministic stacking.
+   - Direct mesh.uuid -> card / slot Maps for instant, unambiguous raycasting.
    ========================================================================== */
 
 // ----------------------------------------------------------------------------
-// 0. CONFIG — the ONE place to look if you want to use your own card art
+// 0. CONFIG & DEBUG
 // ----------------------------------------------------------------------------
-const CONFIG = {
-  // Set to true once you have real card images and want to stop using the
-  // generated placeholder textures.
-  useImageTextures: false,
+const DEBUG_AR = true;     // Real-time diagnostics overlay for physical phone testing
+const DEBUG_BOARD = false;  // Toggle to true to render the gold board bounding box
 
-  // Only used when useImageTextures = true. Files are expected to be named
-  // "<RANK><SUIT-INITIAL>.png", e.g. "AS.png" (Ace of Spades), "10H.png"
-  // (Ten of Hearts), "KD.png" (King of Diamonds). Change buildImageUrl()
-  // below if you want a different naming convention or a texture atlas.
+const CONFIG = {
+  useImageTextures: false,
   cardImagePath: 'assets/cards/',
   cardBackImage: 'assets/back.png',
 };
 
 // ----------------------------------------------------------------------------
-// 1. CONSTANTS — suits, ranks, and the 3D table layout
+// 1. CONSTANTS — dimensions, layout, and AR coordinate space
 // ----------------------------------------------------------------------------
+const BOARD_SCALE = 1.0; // 1:1 target-local coordinate system
+const TEXTURES_REQUIRED = 53; // 52 card faces + 1 card back
+
 const SUITS = ['hearts', 'diamonds', 'clubs', 'spades'];
 const SUIT_SYMBOLS = { hearts: '\u2665', diamonds: '\u2666', clubs: '\u2663', spades: '\u2660' };
 const SUIT_COLORS = { hearts: 'red', diamonds: 'red', clubs: 'black', spades: 'black' };
 const RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
 const RANK_VALUES = RANKS.reduce((map, r, i) => { map[r] = i + 1; return map; }, {});
 
-// Card footprint, in target-local units. A standard poker card is ~2.5:3.5.
+// Card footprint in target-local units (poker 2.5:3.5 aspect ratio)
 const CARD_WIDTH = 0.13;
 const CARD_HEIGHT = 0.182;
 
-// Horizontal spacing between the 7 tableau columns / top-row piles.
-const COL_GAP = 0.16;
+// Horizontal spacing across 7 tableau columns
+const COL_GAP = 0.145;
 const TABLEAU_X = [-3, -2, -1, 0, 1, 2, 3].map((n) => n * COL_GAP);
 
-// Vertical cascade: how far down (in Y) each successive tableau card sits.
-// Face-down cards show only a sliver; face-up cards show enough to read.
-const TABLEAU_TOP_Y = -0.02;
-const TABLEAU_FACEDOWN_STEP = 0.018;
-const TABLEAU_FACEUP_STEP = 0.045;
+// Tableau vertical cascade: strong, distinct spacing so columns never horizontally collapse
+const TABLEAU_TOP_Y = 0.08;
+const TABLEAU_FACEDOWN_STEP = 0.022;
+const TABLEAU_FACEUP_STEP = 0.055;
 
 // Top row: Stock | Waste | (gap) | Foundation x4
-const TOP_ROW_Y = 0.30;
+const TOP_ROW_Y = 0.32;
 const STOCK_POS = { x: TABLEAU_X[0], y: TOP_ROW_Y };
 const WASTE_POS = { x: TABLEAU_X[1], y: TOP_ROW_Y };
 const FOUNDATION_X = [TABLEAU_X[3], TABLEAU_X[4], TABLEAU_X[5], TABLEAU_X[6]];
 const FOUNDATION_Y = TOP_ROW_Y;
 
-// Z-depth given to each card within a pile, so the top card of any pile is
-// always physically closest to the camera (and therefore the one the
-// raycaster hits first). Kept larger than the front/back plane offset below
-// so neighbouring cards' planes never interleave in depth. These are large
-// enough to survive typical AR-camera depth-buffer precision at a marker's
-// viewing distance; on top of this we also apply an explicit polygonOffset
-// per layer (see applyDepthBias) so stacking order never relies solely on
-// floating-point geometry, which is what caused stacked cards to flicker/
-// bleed into each other on-device.
-const CARD_Z_STEP = 0.012;
-const PLANE_Z_OFFSET = 0.003; // front plane at +this, back plane at -this
+// AR depth relative to target surface
+const BOARD_Z = 0.015;     // 1.5 cm above marker plane: eliminates target clipping
+const CARD_Z_STEP = 0.008; // 8 mm physical step per card in stack
 
-// How far (in Y) a selected card/run lifts up to show it's selected.
-const SELECT_LIFT = 0.025;
+// Selection lift
+const SELECT_LIFT_Y = 0.015;
+const SELECT_LIFT_Z = 0.025;
+
+// Calculated board boundaries: 1.00 m wide, 0.85 m tall (fits comfortably in target area)
+const BOARD_WIDTH = 6 * COL_GAP + CARD_WIDTH;
+const BOARD_HEIGHT = 0.85;
 
 // ----------------------------------------------------------------------------
-// 2. GAME STATE
+// 2. GAME STATE & MAPPINGS
 // ----------------------------------------------------------------------------
-let deck = [];              // all 52 card objects, built fresh each new game
-let tableau = [[], [], [], [], [], [], []]; // 7 piles, index 0 = bottom card
-let stock = [];              // face-down draw pile, index 0 = bottom
-let waste = [];              // face-up drawn cards, index 0 = bottom
+let deck = [];
+let tableau = [[], [], [], [], [], [], []];
+let stock = [];
+let waste = [];
 let foundations = { hearts: [], diamonds: [], clubs: [], spades: [] };
 
-// The current selection, or null. Shape: { card, pile, run }
-//   card = the card that was tapped to start the selection
-//   pile = {type: 'tableau'|'waste'|'foundation', index}
-//   run  = ordered array of card objects being moved (length 1 unless a
-//          multi-card tableau sequence was grabbed)
 let selected = null;
 
+// Direct mapping from Three.js mesh.uuid -> Card object or Pile Slot
+const meshToCard = new Map();
+const meshToSlot = new Map();
+const pileSlots = [];
+let texturesReadyCount = 0;
+
 // ----------------------------------------------------------------------------
-// 3. DECK BUILDING / SHUFFLING / DEALING
+// 3. DEBUG OVERLAY HELPER
+// ----------------------------------------------------------------------------
+function updateDebug(data) {
+  if (!DEBUG_AR) return;
+  const panel = document.getElementById('debugPanel');
+  if (panel && panel.style.display === 'none') {
+    panel.style.display = 'block';
+  }
+
+  if (data.tracking !== undefined) {
+    const el = document.getElementById('debugTracking');
+    if (el) el.innerHTML = data.tracking;
+  }
+  if (data.cardMeshes !== undefined) {
+    const el = document.getElementById('debugCardMeshes');
+    if (el) el.textContent = data.cardMeshes;
+  }
+  if (data.visibleMeshes !== undefined) {
+    const el = document.getElementById('debugVisibleMeshes');
+    if (el) el.textContent = data.visibleMeshes;
+  }
+  if (data.texturesReady !== undefined) {
+    const el = document.getElementById('debugTexturesReady');
+    if (el) el.textContent = data.texturesReady;
+  }
+  if (data.pointer !== undefined) {
+    const el = document.getElementById('debugPointer');
+    if (el) el.textContent = data.pointer;
+  }
+  if (data.ndc !== undefined) {
+    const el = document.getElementById('debugNDC');
+    if (el) el.textContent = data.ndc;
+  }
+  if (data.hits !== undefined) {
+    const el = document.getElementById('debugHits');
+    if (el) el.textContent = data.hits;
+  }
+  if (data.hitObject !== undefined) {
+    const el = document.getElementById('debugHitObject');
+    if (el) el.textContent = data.hitObject;
+  }
+  if (data.card !== undefined) {
+    const el = document.getElementById('debugCard');
+    if (el) el.textContent = data.card;
+  }
+  if (data.selected !== undefined) {
+    const el = document.getElementById('debugSelected');
+    if (el) el.textContent = data.selected;
+  }
+  if (data.board !== undefined) {
+    const el = document.getElementById('debugBoard');
+    if (el) el.textContent = data.board;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// 4. DECK BUILDING / SHUFFLING / DEALING
 // ----------------------------------------------------------------------------
 function buildDeck() {
   const cards = [];
@@ -133,17 +154,15 @@ function buildDeck() {
         rankValue: RANK_VALUES[rank],
         color: SUIT_COLORS[suit],
         faceUp: false,
-        location: null,   // set during deal, e.g. {type:'tableau', index:2}
-        el: null,          // <a-entity> wrapper, set by createCardEntity()
-        frontEl: null,
-        backEl: null,
+        location: null,
+        el: null, // Single <a-plane>
+        selected: false,
       });
     }
   }
   return cards;
 }
 
-// Fisher-Yates shuffle.
 function shuffle(array) {
   for (let i = array.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -152,9 +171,26 @@ function shuffle(array) {
   return array;
 }
 
+function refreshDebugDisplay() {
+  const faceUpCount = deck.filter((c) => c.faceUp).length;
+  updateDebug({
+    cardMeshes: '52',
+    visibleMeshes: `${faceUpCount} face-up`,
+    texturesReady: `${texturesReadyCount}/53`,
+    board: `${BOARD_WIDTH.toFixed(2)}x${BOARD_HEIGHT.toFixed(2)} (scale: ${BOARD_SCALE})`
+  });
+}
+
 function dealNewGame() {
+  // Ensure all 53 textures are preloaded and validated before dealing
+  if (!validateTextures()) {
+    preloadAllTextures();
+    validateTextures();
+  }
+
   clearBoard();
   selected = null;
+  meshToCard.clear();
 
   deck = shuffle(buildDeck());
   tableau = [[], [], [], [], [], [], []];
@@ -162,8 +198,6 @@ function dealNewGame() {
   waste = [];
   foundations = { hearts: [], diamonds: [], clubs: [], spades: [] };
 
-  // Standard Klondike deal: column i gets (i+1) cards, only the last is
-  // face up. Remaining 24 cards go face down to the stock.
   let idx = 0;
   for (let col = 0; col < 7; col++) {
     for (let row = 0; row <= col; row++) {
@@ -180,102 +214,211 @@ function dealNewGame() {
     stock.push(card);
   }
 
-  // Create + attach the 3D entity for every card, then snap everything into
-  // its starting position instantly (no animation on the initial deal).
   const container = document.getElementById('cardsContainer');
   deck.forEach((card) => container.appendChild(createCardEntity(card)));
   renderBoard(true);
+
+  refreshDebugDisplay();
+  updateDebug({
+    card: 'DEALT',
+    selected: 'NO',
+  });
+
+  setTimeout(validateAllCards, 50);
 }
 
 function clearBoard() {
   const container = document.getElementById('cardsContainer');
-  while (container.firstChild) container.removeChild(container.firstChild);
+  if (container) {
+    while (container.firstChild) container.removeChild(container.firstChild);
+  }
   const win = document.getElementById('winMessage');
   if (win) win.style.display = 'none';
 }
 
 // ----------------------------------------------------------------------------
-// 4. 3D CARD ENTITY CREATION
+// 5. SINGLE-MESH CARD ENTITY CREATION & VISUAL UPDATING
 // ----------------------------------------------------------------------------
 function createCardEntity(card) {
-  const wrapper = document.createElement('a-entity');
-  wrapper.id = 'card-' + card.id;
-  wrapper.classList.add('card-wrapper');
-  wrapper.dataset.cardId = card.id;
+  // Exactly ONE <a-plane> per card. No wrappers, no front/back plane offsets.
+  const el = document.createElement('a-plane');
+  el.id = 'card-' + card.id;
+  el.classList.add('card-plane');
+  el.setAttribute('width', CARD_WIDTH);
+  el.setAttribute('height', CARD_HEIGHT);
+  el.setAttribute('position', `0 0 ${BOARD_Z}`);
+  el.setAttribute('rotation', '0 0 0');
+  el.setAttribute('material', 'shader: flat; side: double; transparent: false; opacity: 1');
 
-  // --- Front plane: shows rank/suit, faces +Z when wrapper rotation = 0 ---
-  const front = document.createElement('a-plane');
-  front.classList.add('clickable', 'card-front');
-  front.setAttribute('width', CARD_WIDTH);
-  front.setAttribute('height', CARD_HEIGHT);
-  front.setAttribute('position', `0 0 ${PLANE_Z_OFFSET}`);
-  // shader:flat = MeshBasicMaterial -> texture colors render true regardless
-  // of the scene's AR lighting, which is what you want for readable cards.
-  front.setAttribute('material', 'shader: flat; side: front');
+  function initMesh() {
+    const mesh = el.getObject3D('mesh');
+    if (mesh) {
+      meshToCard.set(mesh.uuid, card);
+      mesh.material.transparent = false;
+      mesh.material.opacity = 1.0;
+      mesh.material.side = THREE.DoubleSide;
+      mesh.material.depthTest = true;
+      mesh.material.depthWrite = true;
+      updateCardTexture(card);
+      console.log(`CARD VISUAL READY: card-${card.id}`);
+    } else {
+      el.addEventListener('loaded', () => {
+        const m = el.getObject3D('mesh');
+        if (m) {
+          meshToCard.set(m.uuid, card);
+          m.material.transparent = false;
+          m.material.opacity = 1.0;
+          m.material.side = THREE.DoubleSide;
+          m.material.depthTest = true;
+          m.material.depthWrite = true;
+          updateCardTexture(card);
+          console.log(`CARD VISUAL READY: card-${card.id}`);
+        }
+      }, { once: true });
+    }
+  }
+  initMesh();
 
-  // --- Back plane: pre-rotated 180° so it faces -Z when wrapper rotation = 0
-  //     (i.e. hidden). When the wrapper flips to 180°, this plane's world
-  //     rotation becomes 0° and IT is the one facing the camera. ---
-  const back = document.createElement('a-plane');
-  back.classList.add('clickable', 'card-back');
-  back.setAttribute('width', CARD_WIDTH);
-  back.setAttribute('height', CARD_HEIGHT);
-  back.setAttribute('rotation', '0 180 0');
-  back.setAttribute('position', `0 0 ${-PLANE_Z_OFFSET}`);
-  back.setAttribute('material', 'shader: flat; side: front; color: #8B0000');
-
-  wrapper.appendChild(front);
-  wrapper.appendChild(back);
-
-  // Textures are applied once each plane's mesh actually exists.
-  front.addEventListener('loaded', () => applyTexture(front, getFrontTexture(card)));
-  back.addEventListener('loaded', () => applyTexture(back, getBackTexture()));
-
-  // Click handling: both faces of a card resolve to the same game logic.
-  front.addEventListener('click', () => onCardClicked(card));
-  back.addEventListener('click', () => onCardClicked(card));
-
-  card.el = wrapper;
-  card.frontEl = front;
-  card.backEl = back;
-  return wrapper;
+  card.el = el;
+  return el;
 }
 
-// Uploads a THREE texture onto an <a-plane>'s mesh material. Retries if the
-// mesh isn't ready yet (loaded fires when the entity is attached, but the
-// mesh material is created synchronously by the material component so in
-// practice one attempt is almost always enough — the retry is just a safety
-// net for slow devices).
-function applyTexture(planeEl, texture) {
-  const mesh = planeEl.getObject3D('mesh');
+function updateCardTexture(card) {
+  if (!card || !card.el) return;
+  const mesh = card.el.getObject3D('mesh');
+
+  if (!mesh || !mesh.material) {
+    console.warn('Card mesh not ready:', card.id);
+    return;
+  }
+
+  const texture = card.faceUp
+    ? getFrontTexture(card)
+    : getBackTexture();
+
+  mesh.material.map = texture;
+  mesh.material.color.set(card.selected ? 0xffea75 : 0xffffff);
+  mesh.material.transparent = false;
+  mesh.material.opacity = 1.0;
+  mesh.material.side = THREE.DoubleSide;
+  mesh.material.depthTest = true;
+  mesh.material.depthWrite = true;
+  mesh.material.needsUpdate = true;
+}
+
+// Alias for backwards-compatibility
+function updateCardVisual(card) {
+  updateCardTexture(card);
+}
+
+function validateCard(card) {
+  const mesh = card.el ? card.el.getObject3D('mesh') : null;
+
+  if (!mesh) {
+    console.warn('NO MESH:', card.id);
+    return false;
+  }
+
+  if (!mesh.visible) {
+    console.warn('INVISIBLE MESH:', card.id);
+    return false;
+  }
+
+  if (!mesh.material) {
+    console.warn('NO MATERIAL:', card.id);
+    return false;
+  }
+
+  if (!mesh.material.map) {
+    console.warn('NO TEXTURE:', card.id);
+    return false;
+  }
+
+  if (mesh.material.transparent !== false || mesh.material.opacity !== 1 || mesh.material.depthWrite !== true) {
+    console.warn('INVALID MATERIAL PROPERTIES:', card.id, {
+      transparent: mesh.material.transparent,
+      opacity: mesh.material.opacity,
+      depthWrite: mesh.material.depthWrite
+    });
+    return false;
+  }
+
+  return true;
+}
+
+function validateAllCards() {
+  let validCount = 0;
+  deck.forEach((card) => {
+    if (validateCard(card)) validCount++;
+  });
+  console.log(`VALID CARDS: ${validCount}/52`);
+  return validCount === 52;
+}
+
+function setHighlight(card, on) {
+  card.selected = on;
+  if (!card.el) return;
+  const mesh = card.el.getObject3D('mesh');
   if (mesh && mesh.material) {
-    mesh.material.map = texture;
-    mesh.material.color.set(0xffffff);
-    mesh.material.polygonOffset = true; // baseline; per-layer value set by applyDepthBias
+    mesh.material.color.set(on ? 0xffea75 : 0xffffff);
     mesh.material.needsUpdate = true;
-  } else {
-    setTimeout(() => applyTexture(planeEl, texture), 50);
   }
 }
 
-// Tints a card's two faces to indicate selection. Because the material uses
-// shader:flat (MeshBasicMaterial, no lighting/emissive), tinting is done by
-// multiplying the texture with a colour instead.
-function setHighlight(card, on) {
-  [card.frontEl, card.backEl].forEach((el) => {
-    const mesh = el.getObject3D('mesh');
-    if (mesh && mesh.material) {
-      mesh.material.color.set(on ? 0xffe066 : 0xffffff);
-      mesh.material.needsUpdate = true;
-    }
-  });
-}
-
 // ----------------------------------------------------------------------------
-// 5. TEXTURE GENERATION (placeholder art) — SWAP POINT for your own artwork
+// 6. HIGH-CONTRAST OPAQUE TEXTURES (WHITE CARD FACES / CRIMSON BACK)
 // ----------------------------------------------------------------------------
 const frontTextureCache = {};
 let backTextureCache = null;
+
+function preloadAllTextures() {
+  for (const suit of SUITS) {
+    for (const rank of RANKS) {
+      const card = {
+        suit,
+        rank,
+        color: SUIT_COLORS[suit]
+      };
+      getFrontTexture(card);
+    }
+  }
+  getBackTexture();
+  console.log(`PRELOAD ALL TEXTURES: 52 card faces + 1 card back`);
+}
+
+function validateTextures() {
+  let ready = 0;
+
+  for (const suit of SUITS) {
+    for (const rank of RANKS) {
+      const key = `${suit}_${rank}`;
+      const texture = frontTextureCache[key];
+
+      if (
+        texture &&
+        texture.image &&
+        texture.image.width > 0 &&
+        texture.image.height > 0
+      ) {
+        ready++;
+      }
+    }
+  }
+
+  if (
+    backTextureCache &&
+    backTextureCache.image &&
+    backTextureCache.image.width > 0 &&
+    backTextureCache.image.height > 0
+  ) {
+    ready++;
+  }
+
+  texturesReadyCount = ready;
+  console.log(`TEXTURES READY: ${ready}/53`);
+
+  return ready === TEXTURES_REQUIRED;
+}
 
 function getFrontTexture(card) {
   const key = card.suit + '_' + card.rank;
@@ -283,10 +426,6 @@ function getFrontTexture(card) {
 
   let texture;
   if (CONFIG.useImageTextures) {
-    // ---- SWAP POINT A: load your own per-card image ----
-    // Replace buildCardImageUrl() below to match however you name your
-    // files, or point it at a single texture atlas + set UV offsets on
-    // texture.offset/texture.repeat instead of loading 52 separate images.
     texture = new THREE.TextureLoader().load(buildCardImageUrl(card));
   } else {
     texture = generatePlaceholderFrontTexture(card);
@@ -298,7 +437,6 @@ function getFrontTexture(card) {
 function getBackTexture() {
   if (backTextureCache) return backTextureCache;
   if (CONFIG.useImageTextures) {
-    // ---- SWAP POINT B: load your own card-back image ----
     backTextureCache = new THREE.TextureLoader().load(CONFIG.cardBackImage);
   } else {
     backTextureCache = generatePlaceholderBackTexture();
@@ -307,55 +445,63 @@ function getBackTexture() {
 }
 
 function buildCardImageUrl(card) {
-  const suitInitial = card.suit.charAt(0).toUpperCase(); // H, D, C, S
+  const suitInitial = card.suit.charAt(0).toUpperCase();
   return `${CONFIG.cardImagePath}${card.rank}${suitInitial}.png`;
 }
 
-// Draws a simple but fully readable card face onto a canvas and returns it
-// as a THREE.CanvasTexture. This needs no external files at all, which is
-// why it's the default. Swap to useImageTextures:true whenever you have
-// real artwork ready.
 function generatePlaceholderFrontTexture(card) {
   const canvas = document.createElement('canvas');
   canvas.width = 256;
-  canvas.height = 358; // matches the ~2.5:3.5 card aspect ratio
+  canvas.height = 358;
   const ctx = canvas.getContext('2d');
-  const color = card.color === 'red' ? '#c81e1e' : '#111111';
+  const color = card.color === 'red' ? '#c81010' : '#0a0a0a';
 
-  // Card face background + border
-  ctx.fillStyle = '#fbfbf7';
-  roundRect(ctx, 4, 4, canvas.width - 8, canvas.height - 8, 20, true, false);
-  ctx.strokeStyle = '#333333';
-  ctx.lineWidth = 3;
-  roundRect(ctx, 4, 4, canvas.width - 8, canvas.height - 8, 20, false, true);
+  // Solid pure white background
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Outer dark solid border
+  ctx.strokeStyle = '#1a1a1a';
+  ctx.lineWidth = 4;
+  roundRect(ctx, 4, 4, canvas.width - 8, canvas.height - 8, 18, false, true);
+
+  // Inner subtle border
+  ctx.strokeStyle = '#e0e0e0';
+  ctx.lineWidth = 1;
+  roundRect(ctx, 8, 8, canvas.width - 16, canvas.height - 16, 14, false, true);
 
   ctx.fillStyle = color;
   ctx.textBaseline = 'top';
 
   // Top-left rank + suit
-  ctx.font = 'bold 42px Georgia, serif';
+  ctx.font = 'bold 44px Georgia, serif';
   ctx.fillText(card.rank, 16, 12);
-  ctx.font = '34px Georgia, serif';
-  ctx.fillText(SUIT_SYMBOLS[card.suit], 16, 58);
+  ctx.font = '36px Georgia, serif';
+  ctx.fillText(SUIT_SYMBOLS[card.suit], 16, 60);
 
-  // Bottom-right rank + suit, rotated 180° (standard playing-card layout)
+  // Bottom-right rank + suit
   ctx.save();
   ctx.translate(canvas.width - 16, canvas.height - 12);
   ctx.rotate(Math.PI);
-  ctx.font = 'bold 42px Georgia, serif';
+  ctx.font = 'bold 44px Georgia, serif';
   ctx.fillText(card.rank, 0, 0);
-  ctx.font = '34px Georgia, serif';
-  ctx.fillText(SUIT_SYMBOLS[card.suit], 0, 46);
+  ctx.font = '36px Georgia, serif';
+  ctx.fillText(SUIT_SYMBOLS[card.suit], 0, 48);
   ctx.restore();
 
-  // Big centre suit symbol
-  ctx.font = '130px Georgia, serif';
+  // Centre big suit symbol
+  ctx.font = '136px Georgia, serif';
   ctx.textAlign = 'center';
-  ctx.fillText(SUIT_SYMBOLS[card.suit], canvas.width / 2, canvas.height / 2 - 65);
+  ctx.fillText(SUIT_SYMBOLS[card.suit], canvas.width / 2, canvas.height / 2 - 68);
   ctx.textAlign = 'left';
 
   const texture = new THREE.CanvasTexture(canvas);
+  if (THREE.SRGBColorSpace) {
+    texture.colorSpace = THREE.SRGBColorSpace;
+  }
   texture.needsUpdate = true;
+  texturesReadyCount++;
+  console.log(`TEXTURE READY: ${card.rank}${card.suit.charAt(0).toUpperCase()}`);
   return texture;
 }
 
@@ -365,16 +511,24 @@ function generatePlaceholderBackTexture() {
   canvas.height = 358;
   const ctx = canvas.getContext('2d');
 
-  ctx.fillStyle = '#7a1414';
-  roundRect(ctx, 0, 0, canvas.width, canvas.height, 20, true, false);
-  ctx.strokeStyle = '#f4f1e8';
-  ctx.lineWidth = 6;
-  roundRect(ctx, 14, 14, canvas.width - 28, canvas.height - 28, 14, false, true);
+  // Solid crimson/burgundy background
+  ctx.fillStyle = '#7a1113';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  // Simple diagonal lattice pattern so the back doesn't read as a flat block
-  ctx.strokeStyle = 'rgba(244,241,232,0.35)';
+  // Gold outer border
+  ctx.strokeStyle = '#d4af37';
+  ctx.lineWidth = 5;
+  roundRect(ctx, 6, 6, canvas.width - 12, canvas.height - 12, 16, false, true);
+
+  // Cream inner border
+  ctx.strokeStyle = '#f4f1e8';
   ctx.lineWidth = 2;
-  for (let i = -canvas.height; i < canvas.width; i += 16) {
+  roundRect(ctx, 14, 14, canvas.width - 28, canvas.height - 28, 12, false, true);
+
+  // Diamond lattice pattern
+  ctx.strokeStyle = 'rgba(244, 241, 232, 0.4)';
+  ctx.lineWidth = 2;
+  for (let i = -canvas.height; i < canvas.width; i += 18) {
     ctx.beginPath();
     ctx.moveTo(i, 0);
     ctx.lineTo(i + canvas.height, canvas.height);
@@ -386,12 +540,15 @@ function generatePlaceholderBackTexture() {
   }
 
   const texture = new THREE.CanvasTexture(canvas);
+  if (THREE.SRGBColorSpace) {
+    texture.colorSpace = THREE.SRGBColorSpace;
+  }
   texture.needsUpdate = true;
+  texturesReadyCount++;
+  console.log('TEXTURE READY: BACK');
   return texture;
 }
 
-// Manual rounded-rect path (kept instead of ctx.roundRect for compatibility
-// with older mobile browsers that may be used for the AR camera view).
 function roundRect(ctx, x, y, w, h, r, fill, stroke) {
   ctx.beginPath();
   ctx.moveTo(x + r, y);
@@ -409,41 +566,90 @@ function roundRect(ctx, x, y, w, h, r, fill, stroke) {
 }
 
 // ----------------------------------------------------------------------------
-// 6. PILE SLOTS — invisible/outline click targets for empty piles
+// 7. PILE SLOTS & BOARD BOUNDS
 // ----------------------------------------------------------------------------
-// Every pile gets a thin placeholder plane sitting slightly BEHIND where its
-// cards would be (smaller Z). When the pile is empty this is what the
-// raycaster hits, letting the player tap an empty tableau/foundation spot as
-// a move destination. When the pile has cards, the top card sits in front of
-// it along the ray and is hit first instead — exactly what we want.
+function createBoardBounds(container) {
+  if (!DEBUG_BOARD) return;
+  const existing = document.getElementById('debugBoardBounds');
+  if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
+
+  const box = document.createElement('a-plane');
+  box.id = 'debugBoardBounds';
+  box.setAttribute('width', BOARD_WIDTH);
+  box.setAttribute('height', BOARD_HEIGHT);
+  box.setAttribute('position', `0 -0.01 0.002`);
+  box.setAttribute('material', 'shader: flat; color: #d4af37; wireframe: true; opacity: 0.8; transparent: true');
+  container.appendChild(box);
+}
+
 function createPileSlots() {
   const container = document.getElementById('slotsContainer');
+  if (!container) return;
+  while (container.firstChild) container.removeChild(container.firstChild);
+  meshToSlot.clear();
+  pileSlots.length = 0;
+
   addSlot(container, 'stock', null, STOCK_POS.x, STOCK_POS.y);
   addSlot(container, 'waste', null, WASTE_POS.x, WASTE_POS.y);
   SUITS.forEach((suit, i) => addSlot(container, 'foundation', suit, FOUNDATION_X[i], FOUNDATION_Y));
   for (let c = 0; c < 7; c++) addSlot(container, 'tableau', c, TABLEAU_X[c], TABLEAU_TOP_Y);
+
+  createBoardBounds(container);
 }
 
-function addSlot(container, type, index, x, y) {
+function addSlot(container, type, id, x, y) {
   const el = document.createElement('a-plane');
-  el.classList.add('clickable', 'pile-slot');
+  el.classList.add('pile-slot');
+  el.dataset.pileType = type;
+  if (id !== null && id !== undefined) {
+    el.dataset.pileId = id;
+  }
   el.setAttribute('width', CARD_WIDTH);
   el.setAttribute('height', CARD_HEIGHT);
-  el.setAttribute('position', `${x} ${y} -0.01`);
-  el.setAttribute('material', 'shader: flat; color: #ffffff; opacity: 0.10; transparent: true');
-  el.addEventListener('click', () => handlePileClick({ type, index }));
+  el.setAttribute('position', `${x} ${y} ${BOARD_Z - 0.004}`);
+  el.setAttribute('rotation', '0 0 0');
+  el.setAttribute('material', 'shader: flat; color: #ffffff; opacity: 0.20; transparent: true; side: double');
+
+  const slotData = type === 'foundation'
+    ? { type: 'foundation', suit: id, index: id, el }
+    : { type, index: id, el };
+
+  pileSlots.push(slotData);
+
+  function registerSlotMesh() {
+    const mesh = el.getObject3D('mesh');
+    if (mesh) {
+      mesh.renderOrder = 0;
+      meshToSlot.set(mesh.uuid, slotData);
+    } else {
+      el.addEventListener('loaded', () => {
+        const m = el.getObject3D('mesh');
+        if (m) {
+          m.renderOrder = 0;
+          meshToSlot.set(m.uuid, slotData);
+        }
+      }, { once: true });
+    }
+  }
+  registerSlotMesh();
+
   container.appendChild(el);
 }
 
 // ----------------------------------------------------------------------------
-// 7. LAYOUT / RENDERING — pushes game state out to 3D positions
+// 8. LAYOUT / RENDERING WITH Z-DEPTH & RENDERORDER
 // ----------------------------------------------------------------------------
 function computeTableauPositions(col) {
   const positions = [];
   let y = TABLEAU_TOP_Y;
   const pile = tableau[col];
   for (let i = 0; i < pile.length; i++) {
-    positions.push({ x: TABLEAU_X[col], y, z: i * CARD_Z_STEP });
+    positions.push({
+      x: TABLEAU_X[col],
+      y,
+      z: BOARD_Z + i * CARD_Z_STEP,
+      layer: i,
+    });
     y -= pile[i].faceUp ? TABLEAU_FACEUP_STEP : TABLEAU_FACEDOWN_STEP;
   }
   return positions;
@@ -451,70 +657,56 @@ function computeTableauPositions(col) {
 
 function renderBoard(instant) {
   stock.forEach((card, i) => {
-    setCardTransform(card, { x: STOCK_POS.x, y: STOCK_POS.y, z: i * CARD_Z_STEP }, false, instant);
+    setCardTransform(card, { x: STOCK_POS.x, y: STOCK_POS.y, z: BOARD_Z + i * CARD_Z_STEP, layer: i }, instant);
   });
 
-  // Fan the last few waste cards slightly so recent draws are visible.
   waste.forEach((card, i) => {
     const fromTop = waste.length - 1 - i;
     const fan = fromTop < 3 ? (2 - fromTop) * 0.018 : 0;
-    setCardTransform(card, { x: WASTE_POS.x + fan, y: WASTE_POS.y, z: i * CARD_Z_STEP }, true, instant);
+    setCardTransform(card, { x: WASTE_POS.x + fan, y: WASTE_POS.y, z: BOARD_Z + i * CARD_Z_STEP, layer: i }, instant);
   });
 
   SUITS.forEach((suit, fi) => {
     foundations[suit].forEach((card, i) => {
-      setCardTransform(card, { x: FOUNDATION_X[fi], y: FOUNDATION_Y, z: i * CARD_Z_STEP }, true, instant);
+      setCardTransform(card, { x: FOUNDATION_X[fi], y: FOUNDATION_Y, z: BOARD_Z + i * CARD_Z_STEP, layer: i }, instant);
     });
   });
 
   for (let col = 0; col < 7; col++) {
     const positions = computeTableauPositions(col);
-    tableau[col].forEach((card, i) => setCardTransform(card, positions[i], card.faceUp, instant));
+    tableau[col].forEach((card, i) => setCardTransform(card, positions[i], instant));
   }
+
+  refreshDebugDisplay();
 }
 
-// Biases the depth-test result for a card's two faces so pile stacking
-// order is resolved deterministically by the GPU, instead of relying only
-// on the (very small) real Z gaps between cards. `layer` is the card's
-// index within its pile (0 = bottom). Without this, stacked cards can
-// z-fight and flicker/bleed into each other, especially at the oblique
-// viewing angles typical of handheld AR.
-function applyDepthBias(card, layer) {
-  [card.frontEl, card.backEl].forEach((el) => {
-    const mesh = el.getObject3D('mesh');
-    if (mesh && mesh.material) {
-      mesh.material.polygonOffset = true;
-      mesh.material.polygonOffsetFactor = -layer;
-      mesh.material.polygonOffsetUnits = -layer * 4;
-    }
-  });
-}
-
-function setCardTransform(card, pos, faceUp, instant) {
+function setCardTransform(card, pos, instant) {
   const el = card.el;
   if (!el) return;
-  const targetRotation = faceUp ? '0 0 0' : '0 180 0';
 
-  applyDepthBias(card, Math.round(pos.z / CARD_Z_STEP));
+  updateCardVisual(card);
+
+  const mesh = el.getObject3D('mesh');
+  if (mesh) {
+    mesh.renderOrder = (pos.layer !== undefined ? pos.layer : 0) + 1;
+  }
 
   if (instant) {
     el.removeAttribute('animation__move');
-    el.removeAttribute('animation__flip');
     el.removeAttribute('animation__lift');
     el.setAttribute('position', `${pos.x} ${pos.y} ${pos.z}`);
-    el.setAttribute('rotation', targetRotation);
+    el.setAttribute('rotation', '0 0 0');
   } else {
-    el.setAttribute('animation__move', `property: position; to: ${pos.x} ${pos.y} ${pos.z}; dur: 350; easing: easeOutQuad`);
-    el.setAttribute('animation__flip', `property: rotation; to: ${targetRotation}; dur: 300; easing: easeInOutQuad`);
+    el.setAttribute('animation__move', `property: position; to: ${pos.x} ${pos.y} ${pos.z}; dur: 320; easing: easeOutQuad`);
   }
 }
 
 // ----------------------------------------------------------------------------
-// 8. PILE / RUN HELPERS
+// 9. PILE / RUN HELPERS
 // ----------------------------------------------------------------------------
 function getPileArray(pile) {
   if (pile.type === 'tableau') return tableau[pile.index];
-  if (pile.type === 'foundation') return foundations[pile.index];
+  if (pile.type === 'foundation') return foundations[pile.suit || pile.index];
   if (pile.type === 'waste') return waste;
   if (pile.type === 'stock') return stock;
   return [];
@@ -525,10 +717,6 @@ function isTopOfPile(card, pile) {
   return arr.length > 0 && arr[arr.length - 1].id === card.id;
 }
 
-// A "run" is `card` plus every card above it in its tableau column. It's a
-// legal run to pick up only if every card in it is face up and the whole
-// sequence is alternating-colour, descending rank (standard Klondike rule
-// for moving multiple cards at once).
 function isValidRunFrom(col, card) {
   const arr = tableau[col];
   const idx = arr.findIndex((c) => c.id === card.id);
@@ -550,11 +738,11 @@ function getRunFrom(col, card) {
 }
 
 // ----------------------------------------------------------------------------
-// 9. MOVE VALIDATION RULES
+// 10. MOVE VALIDATION RULES
 // ----------------------------------------------------------------------------
 function canPlaceOnTableau(card, destCol) {
   const arr = tableau[destCol];
-  if (arr.length === 0) return card.rank === 'K'; // only a King may start an empty column
+  if (arr.length === 0) return card.rank === 'K';
   const top = arr[arr.length - 1];
   if (!top.faceUp) return false;
   return top.color !== card.color && top.rankValue === card.rankValue + 1;
@@ -563,64 +751,108 @@ function canPlaceOnTableau(card, destCol) {
 function canPlaceOnFoundation(card, suit) {
   if (card.suit !== suit) return false;
   const arr = foundations[suit];
-  if (arr.length === 0) return card.rank === 'A';
+  if (!arr || arr.length === 0) return card.rank === 'A';
   const top = arr[arr.length - 1];
   return top.rankValue === card.rankValue - 1;
 }
 
 // ----------------------------------------------------------------------------
-// 10. SELECTION
+// 11. SELECTION & FEEDBACK
 // ----------------------------------------------------------------------------
 function selectCard(card, pile) {
   const run = pile.type === 'tableau' ? getRunFrom(pile.index, card) : [card];
   selected = { card, pile, run };
-  run.forEach((c) => {
+
+  run.forEach((c, idx) => {
+    c.selected = true;
     const el = c.el;
-    const pos = el.getAttribute('position');
+    let pos = el.getAttribute('position');
+    if (typeof pos === 'string') {
+      const parts = pos.trim().split(/\s+/).map(Number);
+      pos = { x: parts[0] || 0, y: parts[1] || 0, z: parts[2] || 0 };
+    } else if (!pos && el.object3D) {
+      pos = { x: el.object3D.position.x, y: el.object3D.position.y, z: el.object3D.position.z };
+    } else if (!pos) {
+      pos = { x: 0, y: 0, z: 0 };
+    }
+
+    el.dataset.origX = pos.x;
     el.dataset.origY = pos.y;
-    el.setAttribute('animation__lift', `property: position.y; to: ${pos.y + SELECT_LIFT}; dur: 150; easing: easeOutQuad`);
+    el.dataset.origZ = pos.z;
+
+    const targetY = (parseFloat(pos.y) + SELECT_LIFT_Y).toFixed(4);
+    const targetZ = (parseFloat(pos.z) + SELECT_LIFT_Z).toFixed(4);
+
+    const mesh = el.getObject3D('mesh');
+    if (mesh) {
+      mesh.renderOrder = 200 + idx;
+    }
+
+    el.setAttribute('animation__lift', `property: position; to: ${pos.x} ${targetY} ${targetZ}; dur: 140; easing: easeOutQuad`);
     setHighlight(c, true);
   });
+
+  const cardStr = `${card.rank}${SUIT_SYMBOLS[card.suit]}`;
+  const pileStr = `${pile.type}${pile.index !== undefined ? '[' + pile.index + ']' : pile.suit ? '[' + pile.suit + ']' : ''}`;
+  console.log(`SELECTED: ${cardStr}`);
+  console.log(`SOURCE: ${pileStr}`);
+  updateDebug({
+    selected: `YES (${cardStr})`,
+  });
 }
 
-// Cancels the current selection and animates the run back down.
 function deselectCard() {
   if (!selected) return;
+  const cardStr = `${selected.card.rank}${SUIT_SYMBOLS[selected.card.suit]}`;
+
   selected.run.forEach((c) => {
+    c.selected = false;
     const el = c.el;
-    const origY = parseFloat(el.dataset.origY);
-    el.setAttribute('animation__lift', `property: position.y; to: ${origY}; dur: 150; easing: easeOutQuad`);
+    const origX = el.dataset.origX;
+    const origY = el.dataset.origY;
+    const origZ = el.dataset.origZ;
+    if (origY !== undefined && origZ !== undefined) {
+      el.setAttribute('animation__lift', `property: position; to: ${origX} ${origY} ${origZ}; dur: 140; easing: easeOutQuad`);
+      setTimeout(() => {
+        el.removeAttribute('animation__lift');
+      }, 150);
+    }
     setHighlight(c, false);
   });
+
+  renderBoard(true); // Re-assigns clean layer renderOrders
   selected = null;
+  console.log(`DESELECTED: ${cardStr}`);
+  updateDebug({
+    selected: 'NO',
+  });
 }
 
-// Used right before a successful move: strips the lift/tint instantly
-// (no animate-back) because renderBoard() is about to animate these same
-// cards to their real destination anyway.
 function clearSelectionForMove(run) {
   run.forEach((c) => {
+    c.selected = false;
     c.el.removeAttribute('animation__lift');
     setHighlight(c, false);
   });
 }
 
 // ----------------------------------------------------------------------------
-// 11. CLICK HANDLERS
+// 12. CLICK & ACTION HANDLERS
 // ----------------------------------------------------------------------------
 function onCardClicked(card) {
   const pile = card.location;
   if (!pile) return;
 
-  // Tapping anywhere on the stock always means "draw", regardless of
-  // whether something else is selected (matches physical solitaire).
+  // Stock tap draws immediately
   if (pile.type === 'stock') {
     drawFromStock();
     return;
   }
 
+  // Face-down cards in tableau cannot be selected or targeted
+  if (!card.faceUp) return;
+
   if (!selected) {
-    if (!card.faceUp) return; // can't pick up a face-down card
     if (pile.type === 'foundation' && !isTopOfPile(card, pile)) return;
     if (pile.type === 'waste' && !isTopOfPile(card, pile)) return;
     if (pile.type === 'tableau' && !isValidRunFrom(pile.index, card)) return;
@@ -628,12 +860,14 @@ function onCardClicked(card) {
     return;
   }
 
+  // Tap already-selected card cancels selection
   if (selected.card === card) {
-    deselectCard(); // tapping the already-selected card cancels the selection
+    deselectCard();
     return;
   }
 
-  attemptMove(selected, pile);
+  // Second tap on a different card uses that card's location as destination
+  attemptMove(selected, card.location);
 }
 
 function handlePileClick(pile) {
@@ -641,29 +875,45 @@ function handlePileClick(pile) {
     drawFromStock();
     return;
   }
-  if (!selected) return; // tapping an empty slot with nothing selected does nothing
+  if (!selected) return;
   attemptMove(selected, pile);
 }
 
 // ----------------------------------------------------------------------------
-// 12. MOVE EXECUTION
+// 13. MOVE EXECUTION
 // ----------------------------------------------------------------------------
 function attemptMove(sel, destPile) {
   const { run, pile: srcPile } = sel;
+  const cardStr = `${sel.card.rank}${SUIT_SYMBOLS[sel.card.suit]}`;
+  const destSuit = destPile.suit || destPile.index;
+  const srcSuit = srcPile.suit || srcPile.index;
 
-  // Tapping back into the pile the run already belongs to = cancel.
-  if (destPile.type === srcPile.type && String(destPile.index) === String(srcPile.index)) {
+  const destStr = `${destPile.type}${destPile.index !== undefined ? '[' + destPile.index + ']' : destPile.suit ? '[' + destPile.suit + ']' : ''}`;
+  console.log(`DESTINATION: ${destStr}`);
+  console.log(`MOVE: ${cardStr} → ${destStr}`);
+
+  const isSamePile = destPile.type === srcPile.type && (
+    destPile.type === 'foundation'
+      ? destSuit === srcSuit
+      : destPile.type === 'tableau'
+      ? String(destPile.index) === String(srcPile.index)
+      : true
+  );
+
+  if (isSamePile) {
+    console.log('VALID: false (same pile, canceling)');
     deselectCard();
     return;
   }
 
   let valid = false;
-  if (destPile.type === 'foundation' && run.length === 1 && canPlaceOnFoundation(run[0], destPile.index)) {
+  if (destPile.type === 'foundation' && run.length === 1 && canPlaceOnFoundation(run[0], destSuit)) {
     valid = true;
   } else if (destPile.type === 'tableau' && canPlaceOnTableau(run[0], destPile.index)) {
     valid = true;
   }
 
+  console.log(`VALID: ${valid}`);
   if (valid) {
     clearSelectionForMove(run);
     moveCardsToPile(run, srcPile, destPile);
@@ -671,7 +921,7 @@ function attemptMove(sel, destPile) {
     checkAutoFlipTableauTop(srcPile);
     checkWinCondition();
   } else {
-    deselectCard(); // invalid destination -> snap back to origin
+    deselectCard();
   }
 }
 
@@ -683,16 +933,17 @@ function moveCardsToPile(run, srcPile, destPile) {
   });
 
   const destArr = getPileArray(destPile);
+  const destSuit = destPile.suit || destPile.index;
   run.forEach((c) => {
-    c.location = { type: destPile.type, index: destPile.index };
+    c.location = destPile.type === 'foundation'
+      ? { type: 'foundation', suit: destSuit, index: destSuit }
+      : { type: destPile.type, index: destPile.index };
     destArr.push(c);
   });
 
   renderBoard(false);
 }
 
-// Standard Klondike rule: once a tableau pile's top card is exposed, it
-// automatically turns face up.
 function checkAutoFlipTableauTop(pile) {
   if (pile.type !== 'tableau') return;
   const arr = tableau[pile.index];
@@ -700,27 +951,29 @@ function checkAutoFlipTableauTop(pile) {
   const top = arr[arr.length - 1];
   if (!top.faceUp) {
     top.faceUp = true;
+    updateCardTexture(top);
     renderBoard(false);
+    console.log(`AUTO-FLIP: Revealed ${top.rank}${SUIT_SYMBOLS[top.suit]} at tableau[${pile.index}]`);
   }
 }
 
 // ----------------------------------------------------------------------------
-// 13. STOCK / WASTE
+// 14. STOCK / WASTE
 // ----------------------------------------------------------------------------
 function drawFromStock() {
   if (selected) deselectCard();
 
   if (stock.length === 0) {
-    if (waste.length === 0) return; // truly nothing left to do
-    // Recycle: flip the whole waste pile back into the stock, face down,
-    // in reverse order, so the draw order repeats.
+    if (waste.length === 0) return;
     while (waste.length) {
       const c = waste.pop();
       c.faceUp = false;
       c.location = { type: 'stock' };
       stock.push(c);
+      updateCardTexture(c);
     }
     renderBoard(false);
+    console.log('STOCK: Recycled waste to stock');
     return;
   }
 
@@ -728,11 +981,14 @@ function drawFromStock() {
   card.faceUp = true;
   card.location = { type: 'waste' };
   waste.push(card);
+  updateCardTexture(card);
   renderBoard(false);
+  const cardStr = `${card.rank}${SUIT_SYMBOLS[card.suit]}`;
+  console.log(`STOCK: Drew ${cardStr}`);
 }
 
 // ----------------------------------------------------------------------------
-// 14. WIN CONDITION
+// 15. WIN CONDITION
 // ----------------------------------------------------------------------------
 function checkWinCondition() {
   const won = SUITS.every((s) => foundations[s].length === 13);
@@ -743,55 +999,365 @@ function checkWinCondition() {
 }
 
 // ----------------------------------------------------------------------------
-// 15. MANUAL TAP DETECTION
+// 16. MANUAL TOUCH & RAYCASTING PIPELINE (SINGLE MESH PER CARD)
 // ----------------------------------------------------------------------------
-// We deliberately don't use A-Frame's built-in cursor/raycaster components
-// (see the comment on <a-camera> in index.html) because they depend on the
-// browser synthesizing a "click" after a touch, which MindAR's own touch
-// handling often eats on mobile. Instead we raycast by hand on "pointerup",
-// a single low-level event that covers touch, mouse, and pen uniformly and
-// isn't affected by that suppression. Whichever mesh is hit gets a normal
-// A-Frame "click" event emitted on it, so all the existing
-// addEventListener('click', ...) handlers on cards and pile slots work
-// completely unchanged.
-function setupManualRaycasting() {
-  const scene = document.querySelector('a-scene');
-  const canvas = scene.canvas;
-  if (!canvas) return;
+const raycaster = new THREE.Raycaster();
+let isHandlingTap = false;
+let lastTapProcessedTime = 0;
+let tapStartPos = null;
+let tapStartTime = 0;
 
-  const raycaster = new THREE.Raycaster();
-  const pointer = new THREE.Vector2();
+function getInteractiveMeshes() {
+  const meshes = [];
 
-  canvas.addEventListener('pointerup', (event) => {
-    const camera = scene.camera;
-    if (!camera) return;
+  // Active pile slots: ONLY interactive when the pile is empty!
+  pileSlots.forEach((slotData) => {
+    const mesh = slotData.el ? slotData.el.getObject3D('mesh') : null;
+    if (!mesh) return;
 
-    const rect = canvas.getBoundingClientRect();
-    pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-    pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-    raycaster.setFromCamera(pointer, camera);
+    let isTargetable = false;
+    if (slotData.type === 'stock') {
+      // Stock slot is ONLY targetable to recycle when stock has 0 cards!
+      isTargetable = stock.length === 0;
+    } else if (slotData.type === 'waste') {
+      isTargetable = false;
+    } else if (slotData.type === 'tableau') {
+      isTargetable = tableau[slotData.index] && tableau[slotData.index].length === 0;
+    } else if (slotData.type === 'foundation') {
+      isTargetable = foundations[slotData.suit] && foundations[slotData.suit].length === 0;
+    }
 
-    const meshes = Array.from(document.querySelectorAll('.clickable'))
-      .map((el) => el.getObject3D('mesh'))
-      .filter(Boolean);
-
-    const hits = raycaster.intersectObjects(meshes, false);
-    if (hits.length > 0) {
-      const hitEl = hits[0].object.el; // A-Frame back-reference to the entity
-      if (hitEl) hitEl.emit('click', {}, false);
+    if (isTargetable) {
+      meshes.push(mesh);
     }
   });
+
+  // Active cards: face-up cards + top card of stock
+  deck.forEach((card) => {
+    if (!card.el) return;
+    const mesh = card.el.getObject3D('mesh');
+    if (!mesh) return;
+
+    const isStockTop = card.location && card.location.type === 'stock' && isTopOfPile(card, card.location);
+    if (card.faceUp || isStockTop) {
+      meshes.push(mesh);
+    }
+  });
+
+  return meshes;
+}
+
+function performRaycast(clientX, clientY) {
+  const scene = document.querySelector('a-scene');
+  if (!scene || !scene.camera || !scene.canvas) return;
+
+  const canvas = scene.canvas;
+  const camera = scene.camera;
+  const rect = canvas.getBoundingClientRect();
+
+  if (
+    clientX < rect.left || clientX > rect.right ||
+    clientY < rect.top || clientY > rect.bottom
+  ) {
+    return;
+  }
+
+  // Exact Normalized Device Coordinates relative to WebGL canvas
+  const ndcX = ((clientX - rect.left) / rect.width) * 2 - 1;
+  const ndcY = -((clientY - rect.top) / rect.height) * 2 + 1;
+
+  raycaster.setFromCamera({ x: ndcX, y: ndcY }, camera);
+
+  const candidateMeshes = getInteractiveMeshes();
+  if (candidateMeshes.length === 0) return;
+
+  const hits = raycaster.intersectObjects(candidateMeshes, false);
+
+  updateDebug({
+    pointer: `${Math.round(clientX)}, ${Math.round(clientY)}`,
+    ndc: `${ndcX.toFixed(2)}, ${ndcY.toFixed(2)}`,
+    hits: hits.length
+  });
+
+  if (hits.length === 0) {
+    updateDebug({ hitObject: 'NONE', card: 'NONE' });
+    return;
+  }
+
+  // If multiple hits occur (e.g. cascaded cards in tableau overlapping):
+  // Resolve topmost visual card by sorting primarily by distance from camera,
+  // and breaking ties / near-ties (within 5mm) by renderOrder descending.
+  hits.sort((a, b) => {
+    const distDiff = a.distance - b.distance;
+    const renderOrderA = a.object.renderOrder || 0;
+    const renderOrderB = b.object.renderOrder || 0;
+    if (Math.abs(distDiff) < 0.005) {
+      return renderOrderB - renderOrderA;
+    }
+    return distDiff;
+  });
+
+  const hitMesh = hits[0].object;
+  const card = meshToCard.get(hitMesh.uuid);
+  const slot = meshToSlot.get(hitMesh.uuid);
+
+  updateDebug({
+    hitObject: card ? `card-${card.id}` : slot ? `slot-${slot.type}` : hitMesh.uuid.slice(0, 8)
+  });
+
+  if (card) {
+    const cardStr = `${card.rank}${SUIT_SYMBOLS[card.suit]}`;
+    updateDebug({
+      card: `${cardStr} (${card.location ? card.location.type : '?'})`
+    });
+    onCardClicked(card);
+  } else if (slot) {
+    const slotStr = `${slot.type}${slot.index !== undefined ? '[' + slot.index + ']' : slot.suit ? '[' + slot.suit + ']' : ''}`;
+    updateDebug({
+      card: slotStr
+    });
+    handlePileClick(slot);
+  }
+}
+
+function setupManualRaycasting() {
+  function onTouchStart(e) {
+    if (e.target && e.target.closest && (e.target.closest('#newGameBtn') || e.target.closest('#winMessage'))) {
+      return;
+    }
+    if (e.touches && e.touches.length > 0) {
+      tapStartPos = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+      tapStartTime = performance.now();
+    }
+  }
+
+  function onTouchEnd(e) {
+    if (!tapStartPos) return;
+    if (e.target && e.target.closest && (e.target.closest('#newGameBtn') || e.target.closest('#winMessage'))) {
+      tapStartPos = null;
+      return;
+    }
+    const touch = e.changedTouches && e.changedTouches.length > 0 ? e.changedTouches[0] : null;
+    if (!touch) {
+      tapStartPos = null;
+      return;
+    }
+
+    const dist = Math.hypot(touch.clientX - tapStartPos.x, touch.clientY - tapStartPos.y);
+    const dt = performance.now() - tapStartTime;
+    tapStartPos = null;
+
+    if (dist > 28 || dt > 650) return;
+
+    const now = performance.now();
+    if (isHandlingTap || now - lastTapProcessedTime < 320) return;
+    isHandlingTap = true;
+    lastTapProcessedTime = now;
+
+    try {
+      performRaycast(touch.clientX, touch.clientY);
+    } finally {
+      setTimeout(() => { isHandlingTap = false; }, 100);
+    }
+  }
+
+  function onPointerDown(e) {
+    if (e.pointerType === 'touch') return;
+    if (e.isPrimary === false) return;
+    if (e.target && e.target.closest && (e.target.closest('#newGameBtn') || e.target.closest('#winMessage'))) {
+      return;
+    }
+    tapStartPos = { x: e.clientX, y: e.clientY };
+    tapStartTime = performance.now();
+  }
+
+  function onPointerUp(e) {
+    if (e.pointerType === 'touch') return;
+    if (e.isPrimary === false || !tapStartPos) return;
+    if (e.target && e.target.closest && (e.target.closest('#newGameBtn') || e.target.closest('#winMessage'))) {
+      tapStartPos = null;
+      return;
+    }
+
+    const dist = Math.hypot(e.clientX - tapStartPos.x, e.clientY - tapStartPos.y);
+    const dt = performance.now() - tapStartTime;
+    tapStartPos = null;
+
+    if (dist > 25 || dt > 650) return;
+
+    const now = performance.now();
+    if (isHandlingTap || now - lastTapProcessedTime < 320) return;
+    isHandlingTap = true;
+    lastTapProcessedTime = now;
+
+    try {
+      performRaycast(e.clientX, e.clientY);
+    } finally {
+      setTimeout(() => { isHandlingTap = false; }, 100);
+    }
+  }
+
+  window.addEventListener('touchstart', onTouchStart, { passive: true });
+  window.addEventListener('touchend', onTouchEnd, { passive: true });
+  window.addEventListener('pointerdown', onPointerDown, { passive: true });
+  window.addEventListener('pointerup', onPointerUp, { passive: true });
+
+  window.addEventListener('resize', () => {
+    const scene = document.querySelector('a-scene');
+    if (scene && scene.camera && scene.canvas) {
+      const rect = scene.canvas.getBoundingClientRect();
+      console.log(`RESIZE: Canvas is ${rect.width}x${rect.height}`);
+    }
+  });
+
+  window.addEventListener('orientationchange', () => {
+    setTimeout(() => {
+      const scene = document.querySelector('a-scene');
+      if (scene && scene.camera && scene.canvas) {
+        const rect = scene.canvas.getBoundingClientRect();
+        console.log(`ORIENTATION CHANGE: Canvas is ${rect.width}x${rect.height}`);
+      }
+    }, 200);
+  });
+
+  function setTrackingState(isTracking) {
+    const indicator = document.getElementById('trackingIndicator');
+    if (indicator) {
+      if (isTracking) {
+        indicator.className = 'tracking-indicator tracking-ready';
+        indicator.innerHTML = '<span class="tracking-dot">●</span> <span class="tracking-text">AR Ready</span>';
+      } else {
+        indicator.className = 'tracking-indicator tracking-searching';
+        indicator.innerHTML = '<span class="tracking-dot">○</span> <span class="tracking-text">Point camera at the card/target</span>';
+      }
+    }
+
+    updateDebug({
+      tracking: isTracking
+        ? '<span class="status-tracking">TRACKING</span>'
+        : '<span class="status-searching">SEARCHING</span>'
+    });
+  }
+
+  const targetEl = document.querySelector('[mindar-image-target]');
+  if (targetEl) {
+    targetEl.addEventListener('targetFound', () => {
+      console.log('AR: Target Found');
+      setTrackingState(true);
+    });
+    targetEl.addEventListener('targetLost', () => {
+      console.log('AR: Target Lost');
+      setTrackingState(false);
+    });
+  }
 }
 
 // ----------------------------------------------------------------------------
-// 16. BOOTSTRAP
+// 17. CONTROLLED SCENARIO INTERACTION TEST SUITE
+// ----------------------------------------------------------------------------
+window.runSolitaireInteractionTests = function() {
+  console.log('=== STARTING CONTROLLED SOLITAIRE INTERACTION TESTS ===');
+  let passed = 0;
+  const total = 7;
+
+  dealNewGame();
+
+  // Test 1: Tap visible tableau card
+  const t1Card = tableau[0][0];
+  onCardClicked(t1Card);
+  const pass1 = selected && selected.card === t1Card;
+  console.log(`[Test 1] Select visible tableau card (${t1Card.rank}${t1Card.suit}): ${pass1 ? 'PASS' : 'FAIL'}`);
+  if (pass1) passed++;
+
+  // Test 2: Tap same card again -> cancels
+  onCardClicked(t1Card);
+  const pass2 = selected === null;
+  console.log(`[Test 2] Cancel selection by tapping same card: ${pass2 ? 'PASS' : 'FAIL'}`);
+  if (pass2) passed++;
+
+  // Test 3: Tap stock -> moves 1 card to waste
+  const stockBefore = stock.length;
+  const wasteBefore = waste.length;
+  drawFromStock();
+  const pass3 = stock.length === stockBefore - 1 && waste.length === wasteBefore + 1;
+  console.log(`[Test 3] Draw from stock: ${pass3 ? 'PASS' : 'FAIL'}`);
+  if (pass3) passed++;
+
+  // Test 4: Tap waste card -> selects
+  const topWaste = waste[waste.length - 1];
+  onCardClicked(topWaste);
+  const pass4 = selected && selected.card === topWaste;
+  console.log(`[Test 4] Select top waste card: ${pass4 ? 'PASS' : 'FAIL'}`);
+  if (pass4) passed++;
+  deselectCard();
+
+  // Test 5: Valid tableau move (place Red 8 onto Black 9)
+  const red8 = deck.find((c) => c.rank === '8' && c.color === 'red');
+  const black9 = deck.find((c) => c.rank === '9' && c.color === 'black');
+  tableau[1] = [black9]; black9.faceUp = true; black9.location = { type: 'tableau', index: 1 };
+  tableau[2] = [red8]; red8.faceUp = true; red8.location = { type: 'tableau', index: 2 };
+  onCardClicked(red8);
+  onCardClicked(black9);
+  const pass5 = tableau[1].length === 2 && tableau[1][1] === red8 && tableau[2].length === 0;
+  console.log(`[Test 5] Valid tableau move (8 onto 9): ${pass5 ? 'PASS' : 'FAIL'}`);
+  if (pass5) passed++;
+
+  // Test 6: Invalid move (place 10 onto 8) -> cancels
+  const red10 = deck.find((c) => c.rank === '10' && c.color === 'red');
+  tableau[3] = [red10]; red10.faceUp = true; red10.location = { type: 'tableau', index: 3 };
+  onCardClicked(red10);
+  onCardClicked(red8);
+  const pass6 = selected === null && tableau[3].includes(red10);
+  console.log(`[Test 6] Invalid move rejection: ${pass6 ? 'PASS' : 'FAIL'}`);
+  if (pass6) passed++;
+
+  // Test 7: Empty tableau accepts King only
+  tableau[4] = [];
+  const nonKing = deck.find((c) => c.rank === '5');
+  tableau[5] = [nonKing]; nonKing.faceUp = true; nonKing.location = { type: 'tableau', index: 5 };
+  onCardClicked(nonKing);
+  handlePileClick({ type: 'tableau', index: 4 });
+  const rejectedNonKing = tableau[4].length === 0 && selected === null;
+
+  const king = deck.find((c) => c.rank === 'K');
+  tableau[5] = [king]; king.faceUp = true; king.location = { type: 'tableau', index: 5 };
+  onCardClicked(king);
+  handlePileClick({ type: 'tableau', index: 4 });
+  const acceptedKing = tableau[4].length === 1 && tableau[4][0] === king;
+
+  const pass7 = rejectedNonKing && acceptedKing;
+  console.log(`[Test 7] Empty tableau King validation: ${pass7 ? 'PASS' : 'FAIL'}`);
+  if (pass7) passed++;
+
+  console.log(`=== TEST SUMMARY: ${passed}/${total} PASSED ===`);
+  dealNewGame();
+  return passed === total;
+};
+
+// ----------------------------------------------------------------------------
+// 18. BOOTSTRAP
 // ----------------------------------------------------------------------------
 function init() {
   createPileSlots();
   setupManualRaycasting();
   const newGameBtn = document.getElementById('newGameBtn');
   if (newGameBtn) newGameBtn.addEventListener('click', dealNewGame);
+  window.dealNewGame = dealNewGame;
+
+  // 1. Preload all 53 textures (52 card faces + 1 card back) upfront
+  preloadAllTextures();
+
+  // 2. Validate all 53 textures before dealing
+  const texturesOk = validateTextures();
+  if (!texturesOk) {
+    console.error(`Preloaded textures count mismatch: ${texturesReadyCount}/${TEXTURES_REQUIRED}`);
+  }
+
+  // 3. Deal initial game (creates card meshes, attaches textures, renders board)
   dealNewGame();
+
+  // 4. Validate cards
+  setTimeout(validateAllCards, 50);
 }
 
 const sceneEl = document.querySelector('a-scene');
