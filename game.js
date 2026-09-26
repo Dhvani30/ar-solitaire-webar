@@ -13,7 +13,7 @@
 // ----------------------------------------------------------------------------
 // 0. CONFIG & DEBUG
 // ----------------------------------------------------------------------------
-let DEBUG_AR = false;    // Real-time diagnostics overlay (off by default)
+const DEBUG_AR = true;     // Real-time diagnostics overlay for physical phone testing
 const DEBUG_BOARD = false;  // Toggle to true to render the gold board bounding box
 
 const CONFIG = {
@@ -1763,12 +1763,6 @@ function init() {
   if (undoBtn) undoBtn.addEventListener('click', undo);
   window.dealNewGame = dealNewGame;
   window.undo = undo;
-  window.toggleDebug = function() {
-    DEBUG_AR = !DEBUG_AR;
-    const p = document.getElementById('debugPanel');
-    if (p) p.style.display = DEBUG_AR ? 'block' : 'none';
-    console.log(`DEBUG_AR: ${DEBUG_AR}`);
-  };
 
   // 1. Preload all 53 textures (52 card faces + 1 card back) upfront
   preloadAllTextures();
