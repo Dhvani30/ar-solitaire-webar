@@ -109,45 +109,25 @@ function updateDebug(data) {
     const el = document.getElementById('debugTracking');
     if (el) el.innerHTML = data.tracking;
   }
-  if (data.cardMeshes !== undefined) {
-    const el = document.getElementById('debugCardMeshes');
-    if (el) el.textContent = data.cardMeshes;
-  }
-  if (data.visibleMeshes !== undefined) {
-    const el = document.getElementById('debugVisibleMeshes');
-    if (el) el.textContent = data.visibleMeshes;
-  }
-  if (data.texturesReady !== undefined) {
-    const el = document.getElementById('debugTexturesReady');
-    if (el) el.textContent = data.texturesReady;
-  }
-  if (data.pointer !== undefined) {
-    const el = document.getElementById('debugPointer');
-    if (el) el.textContent = data.pointer;
-  }
-  if (data.ndc !== undefined) {
-    const el = document.getElementById('debugNDC');
-    if (el) el.textContent = data.ndc;
-  }
-  if (data.hits !== undefined) {
-    const el = document.getElementById('debugHits');
-    if (el) el.textContent = data.hits;
-  }
-  if (data.hitObject !== undefined) {
-    const el = document.getElementById('debugHitObject');
-    if (el) el.textContent = data.hitObject;
+  if (data.selected !== undefined) {
+    const el = document.getElementById('debugSelected');
+    if (el) el.textContent = data.selected;
   }
   if (data.card !== undefined) {
     const el = document.getElementById('debugCard');
     if (el) el.textContent = data.card;
   }
-  if (data.selected !== undefined) {
-    const el = document.getElementById('debugSelected');
-    if (el) el.textContent = data.selected;
+  if (data.stock !== undefined) {
+    const el = document.getElementById('debugStock');
+    if (el) el.textContent = data.stock;
   }
-  if (data.board !== undefined) {
-    const el = document.getElementById('debugBoard');
-    if (el) el.textContent = data.board;
+  if (data.foundation !== undefined) {
+    const el = document.getElementById('debugFoundation');
+    if (el) el.textContent = data.foundation;
+  }
+  if (data.moves !== undefined) {
+    const el = document.getElementById('debugMoves');
+    if (el) el.textContent = data.moves;
   }
 }
 
@@ -184,12 +164,14 @@ function shuffle(array) {
 }
 
 function refreshDebugDisplay() {
-  const faceUpCount = deck.filter((c) => c.faceUp).length;
+  const foundationCount = (foundations.hearts ? foundations.hearts.length : 0) +
+                          (foundations.diamonds ? foundations.diamonds.length : 0) +
+                          (foundations.clubs ? foundations.clubs.length : 0) +
+                          (foundations.spades ? foundations.spades.length : 0);
   updateDebug({
-    cardMeshes: '52',
-    visibleMeshes: `${faceUpCount} face-up`,
-    texturesReady: `${texturesReadyCount}/53`,
-    board: `${BOARD_WIDTH.toFixed(2)}x${BOARD_HEIGHT.toFixed(2)} (scale: ${BOARD_SCALE})`
+    stock: stock ? stock.length : 0,
+    foundation: `${foundationCount} / 52`,
+    moves: moveHistory ? moveHistory.length : 0
   });
 }
 
@@ -233,7 +215,7 @@ function dealNewGame() {
   refreshDebugDisplay();
   updateDebug({
     card: 'DEALT',
-    selected: 'NO',
+    selected: 'NONE',
   });
 
   setTimeout(validateAllCards, 50);
@@ -952,7 +934,7 @@ function selectCard(card, pile) {
   console.log(`SELECTED: ${cardStr}`);
   console.log(`SOURCE: ${pileStr}`);
   updateDebug({
-    selected: `YES (${cardStr})`,
+    selected: cardStr,
   });
 }
 
@@ -979,7 +961,7 @@ function deselectCard() {
   selected = null;
   console.log(`DESELECTED: ${cardStr}`);
   updateDebug({
-    selected: 'NO',
+    selected: 'NONE',
   });
 }
 
@@ -1252,6 +1234,7 @@ function updateUndoButton() {
   if (undoBtn) {
     undoBtn.disabled = moveHistory.length === 0;
   }
+  refreshDebugDisplay();
 }
 
 function undo() {
@@ -1423,14 +1406,8 @@ function performRaycast(clientX, clientY) {
 
   const hits = raycaster.intersectObjects(candidateMeshes, false);
 
-  updateDebug({
-    pointer: `${Math.round(clientX)}, ${Math.round(clientY)}`,
-    ndc: `${ndcX.toFixed(2)}, ${ndcY.toFixed(2)}`,
-    hits: hits.length
-  });
-
   if (hits.length === 0) {
-    updateDebug({ hitObject: 'NONE', card: 'NONE' });
+    updateDebug({ card: 'NONE' });
     return;
   }
 
@@ -1451,9 +1428,7 @@ function performRaycast(clientX, clientY) {
   const card = meshToCard.get(hitMesh.uuid);
   const slot = meshToSlot.get(hitMesh.uuid);
 
-  updateDebug({
-    hitObject: card ? `card-${card.id}` : slot ? `slot-${slot.type}` : hitMesh.uuid.slice(0, 8)
-  });
+
 
   if (card) {
     const cardStr = `${card.rank}${SUIT_SYMBOLS[card.suit]}`;
