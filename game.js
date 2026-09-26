@@ -76,7 +76,6 @@ let waste = [];
 let foundations = { hearts: [], diamonds: [], clubs: [], spades: [] };
 
 let selected = null;
-let autoStackTimer = null;
 
 // Direct mapping from Three.js mesh.uuid -> Card object or Pile Slot
 const meshToCard = new Map();
@@ -226,14 +225,9 @@ function dealNewGame() {
   });
 
   setTimeout(validateAllCards, 50);
-  triggerAutoStack(500);
 }
 
 function clearBoard() {
-  if (autoStackTimer) {
-    clearTimeout(autoStackTimer);
-    autoStackTimer = null;
-  }
   const container = document.getElementById('cardsContainer');
   if (container) {
     while (container.firstChild) container.removeChild(container.firstChild);
@@ -998,17 +992,6 @@ function onCardClicked(card) {
   if (!card.faceUp) return;
 
   if (!selected) {
-    // If this card can go to a foundation ('A' and onwards), immediately stack it on tap!
-    if (isTopOfPile(card, pile) && pile.type !== 'foundation' && canPlaceOnFoundation(card, card.suit)) {
-      const destPile = { type: 'foundation', suit: card.suit, index: card.suit };
-      console.log(`TAP-TO-STACK: ${card.rank}${SUIT_SYMBOLS[card.suit]} -> foundation[${card.suit}]`);
-      moveCardsToPile([card], pile, destPile);
-      checkAutoFlipTableauTop(pile);
-      checkWinCondition();
-      triggerAutoStack(320);
-      return;
-    }
-
     if (pile.type === 'foundation' && !isTopOfPile(card, pile)) return;
     if (pile.type === 'waste' && !isTopOfPile(card, pile)) return;
     if (pile.type === 'tableau' && !isValidRunFrom(pile.index, card)) return;
@@ -1016,7 +999,8 @@ function onCardClicked(card) {
     return;
   }
 
-  // Tap already-selected card: if it can stack to foundation, stack it; otherwise cancels selection
+  // Tap already-selected card: if it can stack to foundation, stack it on second tap (double-tap)!
+  // Otherwise cancels selection.
   if (selected.card === card) {
     if (isTopOfPile(card, pile) && pile.type !== 'foundation' && canPlaceOnFoundation(card, card.suit)) {
       deselectCard();
@@ -1024,7 +1008,6 @@ function onCardClicked(card) {
       moveCardsToPile([card], pile, destPile);
       checkAutoFlipTableauTop(pile);
       checkWinCondition();
-      triggerAutoStack(320);
       return;
     }
     deselectCard();
@@ -1093,9 +1076,6 @@ function attemptMove(sel, destPile) {
     selected = null;
     checkAutoFlipTableauTop(srcPile);
     checkWinCondition();
-    if (srcPile.type !== 'foundation') {
-      triggerAutoStack(350);
-    }
   } else {
     deselectCard();
   }
@@ -1134,61 +1114,6 @@ function checkAutoFlipTableauTop(pile) {
 }
 
 // ----------------------------------------------------------------------------
-// 13B. AUTOMATIC & TAP FOUNDATION STACKING ('A' and onwards)
-// ----------------------------------------------------------------------------
-function triggerAutoStack(delay = 250) {
-  if (autoStackTimer) {
-    clearTimeout(autoStackTimer);
-  }
-  autoStackTimer = setTimeout(() => {
-    autoStackTimer = null;
-    checkAndExecuteAutoStack();
-  }, delay);
-}
-
-function checkAndExecuteAutoStack() {
-  if (selected) return;
-
-  // Scan tableau columns (top exposed card) and waste pile for candidates
-  let candidate = null;
-  let candidateSrc = null;
-
-  // 1. Check tableau top cards
-  for (let col = 0; col < 7; col++) {
-    const pile = tableau[col];
-    if (pile.length > 0) {
-      const top = pile[pile.length - 1];
-      if (top.faceUp && canPlaceOnFoundation(top, top.suit)) {
-        if (!candidate || top.rankValue < candidate.rankValue) {
-          candidate = top;
-          candidateSrc = { type: 'tableau', index: col };
-        }
-      }
-    }
-  }
-
-  // 2. Check waste pile top card
-  if (waste.length > 0) {
-    const top = waste[waste.length - 1];
-    if (top.faceUp && canPlaceOnFoundation(top, top.suit)) {
-      if (!candidate || top.rankValue < candidate.rankValue) {
-        candidate = top;
-        candidateSrc = { type: 'waste' };
-      }
-    }
-  }
-
-  if (candidate && candidateSrc) {
-    const destPile = { type: 'foundation', suit: candidate.suit, index: candidate.suit };
-    console.log(`AUTO-STACK: ${candidate.rank}${SUIT_SYMBOLS[candidate.suit]} -> foundation[${candidate.suit}]`);
-    moveCardsToPile([candidate], candidateSrc, destPile);
-    checkAutoFlipTableauTop(candidateSrc);
-    checkWinCondition();
-    triggerAutoStack(320);
-  }
-}
-
-// ----------------------------------------------------------------------------
 // 14. STOCK / WASTE
 // ----------------------------------------------------------------------------
 function drawFromStock() {
@@ -1216,7 +1141,6 @@ function drawFromStock() {
   renderBoard(false);
   const cardStr = `${card.rank}${SUIT_SYMBOLS[card.suit]}`;
   console.log(`STOCK: Drew ${cardStr}`);
-  triggerAutoStack(350);
 }
 
 // ----------------------------------------------------------------------------
@@ -1565,32 +1489,36 @@ window.runSolitaireInteractionTests = function() {
   console.log(`[Test 7] Empty tableau King validation: ${pass7 ? 'PASS' : 'FAIL'}`);
   if (pass7) passed++;
 
-  // Test 8: 'A' cards and onwards stack to foundation on tap
+  // Test 8: 'A' cards and onwards stack to foundation when tapping foundation
   const aceHearts = deck.find((c) => c.rank === 'A' && c.suit === 'hearts');
   const twoHearts = deck.find((c) => c.rank === '2' && c.suit === 'hearts');
   foundations.hearts = [];
   tableau[0] = [aceHearts]; aceHearts.faceUp = true; aceHearts.location = { type: 'tableau', index: 0 };
   tableau[1] = [twoHearts]; twoHearts.faceUp = true; twoHearts.location = { type: 'tableau', index: 1 };
   onCardClicked(aceHearts);
+  handlePileClick({ type: 'foundation', suit: 'hearts' });
   const pass8a = foundations.hearts.length === 1 && foundations.hearts[0] === aceHearts;
   onCardClicked(twoHearts);
+  handlePileClick({ type: 'foundation', suit: 'hearts' });
   const pass8b = foundations.hearts.length === 2 && foundations.hearts[1] === twoHearts;
   const pass8 = pass8a && pass8b;
-  console.log(`[Test 8] Tap 'A' and onwards stacks to foundation: ${pass8 ? 'PASS' : 'FAIL'}`);
+  console.log(`[Test 8] Tap foundation to stack 'A' and onwards: ${pass8 ? 'PASS' : 'FAIL'}`);
   if (pass8) passed++;
 
-  // Test 9: Auto-stacking automatically stacks available 'A' and onwards
+  // Test 9: 'A' cards and onwards stack to foundation on double-tap
   const aceSpades = deck.find((c) => c.rank === 'A' && c.suit === 'spades');
   const twoSpades = deck.find((c) => c.rank === '2' && c.suit === 'spades');
   foundations.spades = [];
   tableau[2] = [aceSpades]; aceSpades.faceUp = true; aceSpades.location = { type: 'tableau', index: 2 };
   tableau[3] = [twoSpades]; twoSpades.faceUp = true; twoSpades.location = { type: 'tableau', index: 3 };
-  checkAndExecuteAutoStack(); // Moves Ace
+  onCardClicked(aceSpades); // first tap: selects
+  onCardClicked(aceSpades); // second tap (double-tap): stacks
   const pass9a = foundations.spades.length === 1 && foundations.spades[0] === aceSpades;
-  checkAndExecuteAutoStack(); // Moves 2
+  onCardClicked(twoSpades); // first tap: selects
+  onCardClicked(twoSpades); // second tap (double-tap): stacks
   const pass9b = foundations.spades.length === 2 && foundations.spades[1] === twoSpades;
   const pass9 = pass9a && pass9b;
-  console.log(`[Test 9] Auto-stacking algorithm: ${pass9 ? 'PASS' : 'FAIL'}`);
+  console.log(`[Test 9] Double-tap 'A' and onwards stacks to foundation: ${pass9 ? 'PASS' : 'FAIL'}`);
   if (pass9) passed++;
 
   console.log(`=== TEST SUMMARY: ${passed}/${total} PASSED ===`);
