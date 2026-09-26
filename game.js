@@ -76,6 +76,7 @@ let waste = [];
 let foundations = { hearts: [], diamonds: [], clubs: [], spades: [] };
 
 let selected = null;
+let autoStackTimer = null;
 
 // Direct mapping from Three.js mesh.uuid -> Card object or Pile Slot
 const meshToCard = new Map();
@@ -225,9 +226,14 @@ function dealNewGame() {
   });
 
   setTimeout(validateAllCards, 50);
+  triggerAutoStack(500);
 }
 
 function clearBoard() {
+  if (autoStackTimer) {
+    clearTimeout(autoStackTimer);
+    autoStackTimer = null;
+  }
   const container = document.getElementById('cardsContainer');
   if (container) {
     while (container.firstChild) container.removeChild(container.firstChild);
@@ -566,8 +572,125 @@ function roundRect(ctx, x, y, w, h, r, fill, stroke) {
 }
 
 // ----------------------------------------------------------------------------
-// 7. PILE SLOTS & BOARD BOUNDS
+// 7. PILE SLOTS, TEXTURES & BOARD BOUNDS
 // ----------------------------------------------------------------------------
+const foundationSlotTextureCache = {};
+let tableauSlotTextureCache = null;
+let stockSlotTextureCache = null;
+
+function getFoundationSlotTexture(suit) {
+  if (foundationSlotTextureCache[suit]) return foundationSlotTextureCache[suit];
+
+  const canvas = document.createElement('canvas');
+  canvas.width = 256;
+  canvas.height = 358;
+  const ctx = canvas.getContext('2d');
+
+  // Subtle dark background with rounded corners
+  ctx.fillStyle = 'rgba(10, 30, 20, 0.45)';
+  roundRect(ctx, 4, 4, canvas.width - 8, canvas.height - 8, 18, true, false);
+
+  // Elegant gold dashed border
+  ctx.strokeStyle = '#d4af37';
+  ctx.lineWidth = 4;
+  ctx.setLineDash([12, 8]);
+  roundRect(ctx, 6, 6, canvas.width - 12, canvas.height - 12, 16, false, true);
+  ctx.setLineDash([]);
+
+  // Center watermark suit symbol
+  const isRed = suit === 'hearts' || suit === 'diamonds';
+  ctx.fillStyle = isRed ? 'rgba(215, 38, 56, 0.65)' : 'rgba(240, 240, 240, 0.55)';
+  ctx.font = '110px Georgia, serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(SUIT_SYMBOLS[suit], canvas.width / 2, canvas.height / 2 + 8);
+
+  // Top-left and bottom-right 'A' watermark indicating 'A' starts here
+  ctx.fillStyle = '#d4af37';
+  ctx.font = 'bold 38px Georgia, serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillText('A', 16, 14);
+
+  ctx.save();
+  ctx.translate(canvas.width - 16, canvas.height - 14);
+  ctx.rotate(Math.PI);
+  ctx.fillText('A', 0, 0);
+  ctx.restore();
+
+  const texture = new THREE.CanvasTexture(canvas);
+  if (THREE.SRGBColorSpace) {
+    texture.colorSpace = THREE.SRGBColorSpace;
+  }
+  texture.needsUpdate = true;
+  foundationSlotTextureCache[suit] = texture;
+  return texture;
+}
+
+function getTableauSlotTexture() {
+  if (tableauSlotTextureCache) return tableauSlotTextureCache;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = 256;
+  canvas.height = 358;
+  const ctx = canvas.getContext('2d');
+
+  ctx.fillStyle = 'rgba(10, 30, 20, 0.25)';
+  roundRect(ctx, 4, 4, canvas.width - 8, canvas.height - 8, 18, true, false);
+
+  ctx.strokeStyle = 'rgba(212, 175, 55, 0.35)';
+  ctx.lineWidth = 3;
+  ctx.setLineDash([10, 8]);
+  roundRect(ctx, 6, 6, canvas.width - 12, canvas.height - 12, 16, false, true);
+  ctx.setLineDash([]);
+
+  ctx.fillStyle = 'rgba(212, 175, 55, 0.4)';
+  ctx.font = 'bold 54px Georgia, serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('K', canvas.width / 2, canvas.height / 2);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  if (THREE.SRGBColorSpace) {
+    texture.colorSpace = THREE.SRGBColorSpace;
+  }
+  texture.needsUpdate = true;
+  tableauSlotTextureCache = texture;
+  return texture;
+}
+
+function getStockSlotTexture() {
+  if (stockSlotTextureCache) return stockSlotTextureCache;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = 256;
+  canvas.height = 358;
+  const ctx = canvas.getContext('2d');
+
+  ctx.fillStyle = 'rgba(10, 30, 20, 0.25)';
+  roundRect(ctx, 4, 4, canvas.width - 8, canvas.height - 8, 18, true, false);
+
+  ctx.strokeStyle = 'rgba(212, 175, 55, 0.35)';
+  ctx.lineWidth = 3;
+  ctx.setLineDash([10, 8]);
+  roundRect(ctx, 6, 6, canvas.width - 12, canvas.height - 12, 16, false, true);
+  ctx.setLineDash([]);
+
+  ctx.fillStyle = 'rgba(212, 175, 55, 0.5)';
+  ctx.font = '64px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('\u21BB', canvas.width / 2, canvas.height / 2);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  if (THREE.SRGBColorSpace) {
+    texture.colorSpace = THREE.SRGBColorSpace;
+  }
+  texture.needsUpdate = true;
+  stockSlotTextureCache = texture;
+  return texture;
+}
+
 function createBoardBounds(container) {
   if (!DEBUG_BOARD) return;
   const existing = document.getElementById('debugBoardBounds');
@@ -608,7 +731,20 @@ function addSlot(container, type, id, x, y) {
   el.setAttribute('height', CARD_HEIGHT);
   el.setAttribute('position', `${x} ${y} ${BOARD_Z - 0.004}`);
   el.setAttribute('rotation', '0 0 0');
-  el.setAttribute('material', 'shader: flat; color: #ffffff; opacity: 0.20; transparent: true; side: double');
+
+  let slotTexture = null;
+  if (type === 'foundation') {
+    slotTexture = getFoundationSlotTexture(id);
+    el.setAttribute('material', 'shader: flat; transparent: true; opacity: 0.85; side: double');
+  } else if (type === 'tableau') {
+    slotTexture = getTableauSlotTexture();
+    el.setAttribute('material', 'shader: flat; transparent: true; opacity: 0.75; side: double');
+  } else if (type === 'stock') {
+    slotTexture = getStockSlotTexture();
+    el.setAttribute('material', 'shader: flat; transparent: true; opacity: 0.75; side: double');
+  } else {
+    el.setAttribute('material', 'shader: flat; color: #ffffff; opacity: 0.20; transparent: true; side: double');
+  }
 
   const slotData = type === 'foundation'
     ? { type: 'foundation', suit: id, index: id, el }
@@ -620,12 +756,20 @@ function addSlot(container, type, id, x, y) {
     const mesh = el.getObject3D('mesh');
     if (mesh) {
       mesh.renderOrder = 0;
+      if (slotTexture && mesh.material) {
+        mesh.material.map = slotTexture;
+        mesh.material.needsUpdate = true;
+      }
       meshToSlot.set(mesh.uuid, slotData);
     } else {
       el.addEventListener('loaded', () => {
         const m = el.getObject3D('mesh');
         if (m) {
           m.renderOrder = 0;
+          if (slotTexture && m.material) {
+            m.material.map = slotTexture;
+            m.material.needsUpdate = true;
+          }
           meshToSlot.set(m.uuid, slotData);
         }
       }, { once: true });
@@ -837,6 +981,7 @@ function clearSelectionForMove(run) {
 }
 
 // ----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // 12. CLICK & ACTION HANDLERS
 // ----------------------------------------------------------------------------
 function onCardClicked(card) {
@@ -853,6 +998,17 @@ function onCardClicked(card) {
   if (!card.faceUp) return;
 
   if (!selected) {
+    // If this card can go to a foundation ('A' and onwards), immediately stack it on tap!
+    if (isTopOfPile(card, pile) && pile.type !== 'foundation' && canPlaceOnFoundation(card, card.suit)) {
+      const destPile = { type: 'foundation', suit: card.suit, index: card.suit };
+      console.log(`TAP-TO-STACK: ${card.rank}${SUIT_SYMBOLS[card.suit]} -> foundation[${card.suit}]`);
+      moveCardsToPile([card], pile, destPile);
+      checkAutoFlipTableauTop(pile);
+      checkWinCondition();
+      triggerAutoStack(320);
+      return;
+    }
+
     if (pile.type === 'foundation' && !isTopOfPile(card, pile)) return;
     if (pile.type === 'waste' && !isTopOfPile(card, pile)) return;
     if (pile.type === 'tableau' && !isValidRunFrom(pile.index, card)) return;
@@ -860,8 +1016,17 @@ function onCardClicked(card) {
     return;
   }
 
-  // Tap already-selected card cancels selection
+  // Tap already-selected card: if it can stack to foundation, stack it; otherwise cancels selection
   if (selected.card === card) {
+    if (isTopOfPile(card, pile) && pile.type !== 'foundation' && canPlaceOnFoundation(card, card.suit)) {
+      deselectCard();
+      const destPile = { type: 'foundation', suit: card.suit, index: card.suit };
+      moveCardsToPile([card], pile, destPile);
+      checkAutoFlipTableauTop(pile);
+      checkWinCondition();
+      triggerAutoStack(320);
+      return;
+    }
     deselectCard();
     return;
   }
@@ -907,8 +1072,16 @@ function attemptMove(sel, destPile) {
   }
 
   let valid = false;
-  if (destPile.type === 'foundation' && run.length === 1 && canPlaceOnFoundation(run[0], destSuit)) {
-    valid = true;
+  let targetPile = destPile;
+
+  if (destPile.type === 'foundation' && run.length === 1) {
+    if (canPlaceOnFoundation(run[0], destSuit)) {
+      valid = true;
+    } else if (canPlaceOnFoundation(run[0], run[0].suit)) {
+      // User tapped foundation area with a card valid for its suit's foundation
+      valid = true;
+      targetPile = { type: 'foundation', suit: run[0].suit, index: run[0].suit };
+    }
   } else if (destPile.type === 'tableau' && canPlaceOnTableau(run[0], destPile.index)) {
     valid = true;
   }
@@ -916,10 +1089,13 @@ function attemptMove(sel, destPile) {
   console.log(`VALID: ${valid}`);
   if (valid) {
     clearSelectionForMove(run);
-    moveCardsToPile(run, srcPile, destPile);
+    moveCardsToPile(run, srcPile, targetPile);
     selected = null;
     checkAutoFlipTableauTop(srcPile);
     checkWinCondition();
+    if (srcPile.type !== 'foundation') {
+      triggerAutoStack(350);
+    }
   } else {
     deselectCard();
   }
@@ -958,6 +1134,61 @@ function checkAutoFlipTableauTop(pile) {
 }
 
 // ----------------------------------------------------------------------------
+// 13B. AUTOMATIC & TAP FOUNDATION STACKING ('A' and onwards)
+// ----------------------------------------------------------------------------
+function triggerAutoStack(delay = 250) {
+  if (autoStackTimer) {
+    clearTimeout(autoStackTimer);
+  }
+  autoStackTimer = setTimeout(() => {
+    autoStackTimer = null;
+    checkAndExecuteAutoStack();
+  }, delay);
+}
+
+function checkAndExecuteAutoStack() {
+  if (selected) return;
+
+  // Scan tableau columns (top exposed card) and waste pile for candidates
+  let candidate = null;
+  let candidateSrc = null;
+
+  // 1. Check tableau top cards
+  for (let col = 0; col < 7; col++) {
+    const pile = tableau[col];
+    if (pile.length > 0) {
+      const top = pile[pile.length - 1];
+      if (top.faceUp && canPlaceOnFoundation(top, top.suit)) {
+        if (!candidate || top.rankValue < candidate.rankValue) {
+          candidate = top;
+          candidateSrc = { type: 'tableau', index: col };
+        }
+      }
+    }
+  }
+
+  // 2. Check waste pile top card
+  if (waste.length > 0) {
+    const top = waste[waste.length - 1];
+    if (top.faceUp && canPlaceOnFoundation(top, top.suit)) {
+      if (!candidate || top.rankValue < candidate.rankValue) {
+        candidate = top;
+        candidateSrc = { type: 'waste' };
+      }
+    }
+  }
+
+  if (candidate && candidateSrc) {
+    const destPile = { type: 'foundation', suit: candidate.suit, index: candidate.suit };
+    console.log(`AUTO-STACK: ${candidate.rank}${SUIT_SYMBOLS[candidate.suit]} -> foundation[${candidate.suit}]`);
+    moveCardsToPile([candidate], candidateSrc, destPile);
+    checkAutoFlipTableauTop(candidateSrc);
+    checkWinCondition();
+    triggerAutoStack(320);
+  }
+}
+
+// ----------------------------------------------------------------------------
 // 14. STOCK / WASTE
 // ----------------------------------------------------------------------------
 function drawFromStock() {
@@ -985,6 +1216,7 @@ function drawFromStock() {
   renderBoard(false);
   const cardStr = `${card.rank}${SUIT_SYMBOLS[card.suit]}`;
   console.log(`STOCK: Drew ${cardStr}`);
+  triggerAutoStack(350);
 }
 
 // ----------------------------------------------------------------------------
@@ -1258,12 +1490,14 @@ function setupManualRaycasting() {
 window.runSolitaireInteractionTests = function() {
   console.log('=== STARTING CONTROLLED SOLITAIRE INTERACTION TESTS ===');
   let passed = 0;
-  const total = 7;
+  const total = 9;
 
   dealNewGame();
 
-  // Test 1: Tap visible tableau card
-  const t1Card = tableau[0][0];
+  // Test 1: Tap visible tableau card (non-foundation candidate to verify selection)
+  let t1Col = tableau.findIndex(col => col.length > 0 && col[col.length - 1].rank !== 'A');
+  if (t1Col === -1) t1Col = 0;
+  const t1Card = tableau[t1Col][tableau[t1Col].length - 1];
   onCardClicked(t1Card);
   const pass1 = selected && selected.card === t1Card;
   console.log(`[Test 1] Select visible tableau card (${t1Card.rank}${t1Card.suit}): ${pass1 ? 'PASS' : 'FAIL'}`);
@@ -1283,8 +1517,10 @@ window.runSolitaireInteractionTests = function() {
   console.log(`[Test 3] Draw from stock: ${pass3 ? 'PASS' : 'FAIL'}`);
   if (pass3) passed++;
 
-  // Test 4: Tap waste card -> selects
+  // Test 4: Tap waste card -> selects (ensuring card doesn't stack directly)
   const topWaste = waste[waste.length - 1];
+  topWaste.rank = '10';
+  topWaste.rankValue = 10;
   onCardClicked(topWaste);
   const pass4 = selected && selected.card === topWaste;
   console.log(`[Test 4] Select top waste card: ${pass4 ? 'PASS' : 'FAIL'}`);
@@ -1328,6 +1564,34 @@ window.runSolitaireInteractionTests = function() {
   const pass7 = rejectedNonKing && acceptedKing;
   console.log(`[Test 7] Empty tableau King validation: ${pass7 ? 'PASS' : 'FAIL'}`);
   if (pass7) passed++;
+
+  // Test 8: 'A' cards and onwards stack to foundation on tap
+  const aceHearts = deck.find((c) => c.rank === 'A' && c.suit === 'hearts');
+  const twoHearts = deck.find((c) => c.rank === '2' && c.suit === 'hearts');
+  foundations.hearts = [];
+  tableau[0] = [aceHearts]; aceHearts.faceUp = true; aceHearts.location = { type: 'tableau', index: 0 };
+  tableau[1] = [twoHearts]; twoHearts.faceUp = true; twoHearts.location = { type: 'tableau', index: 1 };
+  onCardClicked(aceHearts);
+  const pass8a = foundations.hearts.length === 1 && foundations.hearts[0] === aceHearts;
+  onCardClicked(twoHearts);
+  const pass8b = foundations.hearts.length === 2 && foundations.hearts[1] === twoHearts;
+  const pass8 = pass8a && pass8b;
+  console.log(`[Test 8] Tap 'A' and onwards stacks to foundation: ${pass8 ? 'PASS' : 'FAIL'}`);
+  if (pass8) passed++;
+
+  // Test 9: Auto-stacking automatically stacks available 'A' and onwards
+  const aceSpades = deck.find((c) => c.rank === 'A' && c.suit === 'spades');
+  const twoSpades = deck.find((c) => c.rank === '2' && c.suit === 'spades');
+  foundations.spades = [];
+  tableau[2] = [aceSpades]; aceSpades.faceUp = true; aceSpades.location = { type: 'tableau', index: 2 };
+  tableau[3] = [twoSpades]; twoSpades.faceUp = true; twoSpades.location = { type: 'tableau', index: 3 };
+  checkAndExecuteAutoStack(); // Moves Ace
+  const pass9a = foundations.spades.length === 1 && foundations.spades[0] === aceSpades;
+  checkAndExecuteAutoStack(); // Moves 2
+  const pass9b = foundations.spades.length === 2 && foundations.spades[1] === twoSpades;
+  const pass9 = pass9a && pass9b;
+  console.log(`[Test 9] Auto-stacking algorithm: ${pass9 ? 'PASS' : 'FAIL'}`);
+  if (pass9) passed++;
 
   console.log(`=== TEST SUMMARY: ${passed}/${total} PASSED ===`);
   dealNewGame();
