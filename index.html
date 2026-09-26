@@ -107,6 +107,101 @@
             font-size: 12px;
         }
 
+        /* MindAR Target Scanning Reticle: High-contrast glowing red viewfinder */
+        .mindar-ui-scanning .scanning .inner {
+            background:
+                linear-gradient(to right, #ff2a2a 10px, transparent 10px) 0 0,
+                linear-gradient(to right, #ff2a2a 10px, transparent 10px) 0 100%,
+                linear-gradient(to left, #ff2a2a 10px, transparent 10px) 100% 0,
+                linear-gradient(to left, #ff2a2a 10px, transparent 10px) 100% 100%,
+                linear-gradient(to bottom, #ff2a2a 10px, transparent 10px) 0 0,
+                linear-gradient(to bottom, #ff2a2a 10px, transparent 10px) 100% 0,
+                linear-gradient(to top, #ff2a2a 10px, transparent 10px) 0 100%,
+                linear-gradient(to top, #ff2a2a 10px, transparent 10px) 100% 100% !important;
+            background-repeat: no-repeat !important;
+            background-size: 40px 40px !important;
+            opacity: 1 !important;
+            filter: drop-shadow(0 0 10px rgba(255, 42, 42, 0.85)) !important;
+        }
+
+        .mindar-ui-scanning .scanning .inner .scanline,
+        .mindar-ui-scanning .scanline {
+            background: #ff2a2a !important;
+            box-shadow: 0 0 14px rgba(255, 42, 42, 0.95), 0 0 6px #ff0000 !important;
+            border-radius: 2px !important;
+        }
+
+        .top-row {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            width: 100%;
+            max-width: 520px;
+            gap: 12px;
+            pointer-events: none;
+        }
+
+        .score-badge {
+            pointer-events: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 14px;
+            border-radius: 999px;
+            background: rgba(15, 46, 34, 0.90);
+            border: 1px solid rgba(212, 175, 55, 0.45);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
+            color: var(--cream);
+            font-size: 13px;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+        }
+        .score-badge .score-title {
+            color: var(--gold);
+            font-size: 11px;
+            letter-spacing: 0.08em;
+        }
+        .score-badge .score-val {
+            font-family: SFMono-Regular, Consolas, monospace;
+            font-size: 15px;
+            color: #ffffff;
+            font-weight: 700;
+            min-width: 24px;
+            text-align: right;
+            display: inline-block;
+            transition: transform 0.2s ease, color 0.2s ease;
+        }
+        .score-badge .score-val.bump {
+            transform: scale(1.3);
+            color: var(--gold);
+        }
+
+        .bonus-notification {
+            position: fixed;
+            top: 76px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 100;
+            background: linear-gradient(135deg, rgba(212, 175, 55, 0.95), rgba(180, 140, 20, 0.95));
+            color: #0f2e22;
+            padding: 8px 22px;
+            border-radius: 999px;
+            font-weight: 800;
+            font-size: 15px;
+            letter-spacing: 0.03em;
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+            pointer-events: none;
+            text-align: center;
+            white-space: nowrap;
+        }
+        @keyframes bonusFade {
+            0% { opacity: 0; transform: translate(-50%, -10px) scale(0.85); }
+            15% { opacity: 1; transform: translate(-50%, 0) scale(1.08); }
+            25% { transform: translate(-50%, 0) scale(1); }
+            80% { opacity: 1; transform: translate(-50%, 0); }
+            100% { opacity: 0; transform: translate(-50%, -15px); }
+        }
+
         .btn-group {
             pointer-events: auto;
             display: flex;
@@ -206,22 +301,21 @@
 
     <div id="debugPanel" style="display: none;">
         <div>AR: <span id="debugTracking" class="status-searching">SEARCHING</span></div>
-        <div>CARD MESHES: <span id="debugCardMeshes" class="highlight-val">52</span></div>
-        <div>VISIBLE MESHES: <span id="debugVisibleMeshes" class="highlight-val">0</span></div>
-        <div>TEXTURES READY: <span id="debugTexturesReady" class="highlight-val">0/53</span></div>
-        <div>POINTER: <span id="debugPointer" class="highlight-val">-</span></div>
-        <div>NDC: <span id="debugNDC">-</span></div>
-        <div>HITS: <span id="debugHits" class="highlight-val">0</span></div>
-        <div>HIT OBJECT: <span id="debugHitObject">-</span></div>
-        <div>CARD: <span id="debugCard" class="highlight-val">NONE</span></div>
-        <div>SELECTED: <span id="debugSelected">NO</span></div>
-        <div>BOARD: <span id="debugBoard" class="highlight-val">-</span></div>
+        <div>SELECTED: <span id="debugSelected" class="highlight-val">NONE</span></div>
+        <div>ACTION: <span id="debugCard" class="highlight-val">NONE</span></div>
+        <div>STOCK: <span id="debugStock" class="highlight-val">24</span></div>
+        <div>FOUNDATION: <span id="debugFoundation" class="highlight-val">0 / 52</span></div>
+        <div>MOVES: <span id="debugMoves" class="highlight-val">0</span></div>
     </div>
 
     <div class="overlay">
-        <div id="trackingIndicator" class="tracking-indicator tracking-searching">
-            <span class="tracking-dot">○</span> <span class="tracking-text">Point camera at the card/target</span>
+        <div class="top-row">
+            <div id="scoreBadge" class="score-badge">
+                <span class="score-title">SCORE</span>
+                <span id="scoreVal" class="score-val">0</span>
+            </div>
         </div>
+        <div id="bonusNotification" class="bonus-notification" style="display: none;"></div>
         <div class="btn-group">
             <button id="undoBtn" class="action-btn undo-btn" type="button" disabled>Undo</button>
             <button id="newGameBtn" class="action-btn new-game-btn" type="button">New Game</button>
@@ -232,6 +326,7 @@
         <div class="card">
             <h1>You Win!</h1>
             <p>All four foundations are complete.</p>
+            <p id="winScoreText" style="font-size: 18px; color: var(--gold); font-weight: bold; margin-bottom: 20px;">Score: 0</p>
             <button type="button" onclick="dealNewGame()">Play Again</button>
         </div>
     </div>

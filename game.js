@@ -77,6 +77,17 @@ let foundations = { hearts: [], diamonds: [], clubs: [], spades: [] };
 
 let selected = null;
 const moveHistory = [];
+let score = 0;
+let completedFoundations = { hearts: false, diamonds: false, clubs: false, spades: false };
+
+const POINTS = {
+  MOVE_TABLEAU: 5,            // Move card/run to tableau
+  MOVE_FOUNDATION: 10,        // Move card to foundation
+  REVEAL_CARD: 5,             // Auto-flip face-down tableau card
+  FOUNDATION_TO_TABLEAU: -15, // Return card from foundation to tableau
+  STACK_COMPLETE_BONUS: 250,  // Complete full suit 13-card stack (A through K)
+  WIN_BONUS: 500,             // Complete all 4 foundations (Win game)
+};
 
 // Direct mapping from Three.js mesh.uuid -> Card object or Pile Slot
 const meshToCard = new Map();
@@ -98,45 +109,25 @@ function updateDebug(data) {
     const el = document.getElementById('debugTracking');
     if (el) el.innerHTML = data.tracking;
   }
-  if (data.cardMeshes !== undefined) {
-    const el = document.getElementById('debugCardMeshes');
-    if (el) el.textContent = data.cardMeshes;
-  }
-  if (data.visibleMeshes !== undefined) {
-    const el = document.getElementById('debugVisibleMeshes');
-    if (el) el.textContent = data.visibleMeshes;
-  }
-  if (data.texturesReady !== undefined) {
-    const el = document.getElementById('debugTexturesReady');
-    if (el) el.textContent = data.texturesReady;
-  }
-  if (data.pointer !== undefined) {
-    const el = document.getElementById('debugPointer');
-    if (el) el.textContent = data.pointer;
-  }
-  if (data.ndc !== undefined) {
-    const el = document.getElementById('debugNDC');
-    if (el) el.textContent = data.ndc;
-  }
-  if (data.hits !== undefined) {
-    const el = document.getElementById('debugHits');
-    if (el) el.textContent = data.hits;
-  }
-  if (data.hitObject !== undefined) {
-    const el = document.getElementById('debugHitObject');
-    if (el) el.textContent = data.hitObject;
+  if (data.selected !== undefined) {
+    const el = document.getElementById('debugSelected');
+    if (el) el.textContent = data.selected;
   }
   if (data.card !== undefined) {
     const el = document.getElementById('debugCard');
     if (el) el.textContent = data.card;
   }
-  if (data.selected !== undefined) {
-    const el = document.getElementById('debugSelected');
-    if (el) el.textContent = data.selected;
+  if (data.stock !== undefined) {
+    const el = document.getElementById('debugStock');
+    if (el) el.textContent = data.stock;
   }
-  if (data.board !== undefined) {
-    const el = document.getElementById('debugBoard');
-    if (el) el.textContent = data.board;
+  if (data.foundation !== undefined) {
+    const el = document.getElementById('debugFoundation');
+    if (el) el.textContent = data.foundation;
+  }
+  if (data.moves !== undefined) {
+    const el = document.getElementById('debugMoves');
+    if (el) el.textContent = data.moves;
   }
 }
 
@@ -173,12 +164,14 @@ function shuffle(array) {
 }
 
 function refreshDebugDisplay() {
-  const faceUpCount = deck.filter((c) => c.faceUp).length;
+  const foundationCount = (foundations.hearts ? foundations.hearts.length : 0) +
+                          (foundations.diamonds ? foundations.diamonds.length : 0) +
+                          (foundations.clubs ? foundations.clubs.length : 0) +
+                          (foundations.spades ? foundations.spades.length : 0);
   updateDebug({
-    cardMeshes: '52',
-    visibleMeshes: `${faceUpCount} face-up`,
-    texturesReady: `${texturesReadyCount}/53`,
-    board: `${BOARD_WIDTH.toFixed(2)}x${BOARD_HEIGHT.toFixed(2)} (scale: ${BOARD_SCALE})`
+    stock: stock ? stock.length : 0,
+    foundation: `${foundationCount} / 52`,
+    moves: moveHistory ? moveHistory.length : 0
   });
 }
 
@@ -222,10 +215,13 @@ function dealNewGame() {
   refreshDebugDisplay();
   updateDebug({
     card: 'DEALT',
-    selected: 'NO',
+    selected: 'NONE',
   });
 
   setTimeout(validateAllCards, 50);
+  score = 0;
+  completedFoundations = { hearts: false, diamonds: false, clubs: false, spades: false };
+  updateScoreDisplay(false);
   moveHistory.length = 0;
   updateUndoButton();
 }
@@ -938,7 +934,7 @@ function selectCard(card, pile) {
   console.log(`SELECTED: ${cardStr}`);
   console.log(`SOURCE: ${pileStr}`);
   updateDebug({
-    selected: `YES (${cardStr})`,
+    selected: cardStr,
   });
 }
 
@@ -965,7 +961,7 @@ function deselectCard() {
   selected = null;
   console.log(`DESELECTED: ${cardStr}`);
   updateDebug({
-    selected: 'NO',
+    selected: 'NONE',
   });
 }
 
@@ -1010,6 +1006,8 @@ function onCardClicked(card) {
       deselectCard();
       const destPile = { type: 'foundation', suit: card.suit, index: card.suit };
       moveCardsToPile([card], pile, destPile);
+      addScore(POINTS.MOVE_FOUNDATION, 'Double-tap to foundation');
+      checkFoundationCompletionBonus();
       checkAutoFlipTableauTop(pile);
       checkWinCondition();
       return;
@@ -1079,6 +1077,19 @@ function attemptMove(sel, destPile) {
     clearSelectionForMove(run);
     moveCardsToPile(run, srcPile, targetPile);
     selected = null;
+
+    // Score move
+    if (targetPile.type === 'foundation') {
+      addScore(POINTS.MOVE_FOUNDATION, 'Moved to foundation');
+      checkFoundationCompletionBonus();
+    } else if (targetPile.type === 'tableau') {
+      if (srcPile.type === 'foundation') {
+        addScore(POINTS.FOUNDATION_TO_TABLEAU, 'Foundation to tableau');
+      } else {
+        addScore(POINTS.MOVE_TABLEAU, 'Moved to tableau');
+      }
+    }
+
     checkAutoFlipTableauTop(srcPile);
     checkWinCondition();
   } else {
@@ -1114,6 +1125,7 @@ function checkAutoFlipTableauTop(pile) {
     top.faceUp = true;
     updateCardTexture(top);
     renderBoard(false);
+    addScore(POINTS.REVEAL_CARD, 'Revealed hidden card');
     console.log(`AUTO-FLIP: Revealed ${top.rank}${SUIT_SYMBOLS[top.suit]} at tableau[${pile.index}]`);
   }
 }
@@ -1151,10 +1163,58 @@ function drawFromStock() {
 }
 
 // ----------------------------------------------------------------------------
-// 14B. UNDO SYSTEM
+// 14B. SCORING & UNDO SYSTEM
 // ----------------------------------------------------------------------------
+function addScore(pts, reason = '') {
+  score = Math.max(0, score + pts);
+  updateScoreDisplay(pts > 0);
+  if (reason) {
+    console.log(`SCORE: ${pts > 0 ? '+' : ''}${pts} pts (${reason}) -> Total: ${score}`);
+  }
+}
+
+function updateScoreDisplay(bump = false) {
+  const el = document.getElementById('scoreVal');
+  if (el) {
+    el.textContent = score;
+    if (bump) {
+      el.classList.add('bump');
+      setTimeout(() => el.classList.remove('bump'), 220);
+    }
+  }
+}
+
+let bonusNotificationTimer = null;
+function showBonusNotification(text) {
+  const el = document.getElementById('bonusNotification');
+  if (!el) return;
+  if (bonusNotificationTimer) clearTimeout(bonusNotificationTimer);
+  el.textContent = text;
+  el.style.display = 'block';
+  el.style.animation = 'none';
+  void el.offsetWidth;
+  el.style.animation = 'bonusFade 2.2s ease forwards';
+  bonusNotificationTimer = setTimeout(() => {
+    if (el) el.style.display = 'none';
+    bonusNotificationTimer = null;
+  }, 2200);
+}
+
+function checkFoundationCompletionBonus() {
+  SUITS.forEach((suit) => {
+    if (foundations[suit].length === 13 && !completedFoundations[suit]) {
+      completedFoundations[suit] = true;
+      const suitName = suit.toUpperCase();
+      addScore(POINTS.STACK_COMPLETE_BONUS, `${suitName} Stack Complete`);
+      showBonusNotification(`★ ${suitName} STACK COMPLETE! +${POINTS.STACK_COMPLETE_BONUS} ★`);
+    }
+  });
+}
+
 function saveState() {
   const snapshot = {
+    score,
+    completedFoundations: { ...completedFoundations },
     tableau: tableau.map((col) => col.map((c) => ({ id: c.id, faceUp: c.faceUp }))),
     stock: stock.map((c) => ({ id: c.id, faceUp: c.faceUp })),
     waste: waste.map((c) => ({ id: c.id, faceUp: c.faceUp })),
@@ -1174,6 +1234,7 @@ function updateUndoButton() {
   if (undoBtn) {
     undoBtn.disabled = moveHistory.length === 0;
   }
+  refreshDebugDisplay();
 }
 
 function undo() {
@@ -1181,6 +1242,12 @@ function undo() {
   if (selected) deselectCard();
 
   const prev = moveHistory.pop();
+  score = prev.score !== undefined ? prev.score : 0;
+  completedFoundations = prev.completedFoundations
+    ? { ...prev.completedFoundations }
+    : { hearts: false, diamonds: false, clubs: false, spades: false };
+  updateScoreDisplay(false);
+
   const cardMap = new Map();
   deck.forEach((c) => cardMap.set(c.id, c));
 
@@ -1247,7 +1314,7 @@ function undo() {
   renderBoard(false);
   updateUndoButton();
   refreshDebugDisplay();
-  console.log(`UNDO: Restored previous state (${moveHistory.length} remaining in history)`);
+  console.log(`UNDO: Restored previous state and score (${moveHistory.length} remaining in history)`);
 }
 
 // ----------------------------------------------------------------------------
@@ -1256,6 +1323,9 @@ function undo() {
 function checkWinCondition() {
   const won = SUITS.every((s) => foundations[s].length === 13);
   if (won) {
+    addScore(POINTS.WIN_BONUS, 'Game Complete');
+    const winScoreEl = document.getElementById('winScoreText');
+    if (winScoreEl) winScoreEl.textContent = `Final Score: ${score}`;
     const win = document.getElementById('winMessage');
     if (win) win.style.display = 'flex';
   }
@@ -1336,14 +1406,8 @@ function performRaycast(clientX, clientY) {
 
   const hits = raycaster.intersectObjects(candidateMeshes, false);
 
-  updateDebug({
-    pointer: `${Math.round(clientX)}, ${Math.round(clientY)}`,
-    ndc: `${ndcX.toFixed(2)}, ${ndcY.toFixed(2)}`,
-    hits: hits.length
-  });
-
   if (hits.length === 0) {
-    updateDebug({ hitObject: 'NONE', card: 'NONE' });
+    updateDebug({ card: 'NONE' });
     return;
   }
 
@@ -1364,9 +1428,7 @@ function performRaycast(clientX, clientY) {
   const card = meshToCard.get(hitMesh.uuid);
   const slot = meshToSlot.get(hitMesh.uuid);
 
-  updateDebug({
-    hitObject: card ? `card-${card.id}` : slot ? `slot-${slot.type}` : hitMesh.uuid.slice(0, 8)
-  });
+
 
   if (card) {
     const cardStr = `${card.rank}${SUIT_SYMBOLS[card.suit]}`;
@@ -1526,7 +1588,7 @@ function setupManualRaycasting() {
 window.runSolitaireInteractionTests = function() {
   console.log('=== STARTING CONTROLLED SOLITAIRE INTERACTION TESTS ===');
   let passed = 0;
-  const total = 10;
+  const total = 11;
 
   dealNewGame();
 
@@ -1643,6 +1705,21 @@ window.runSolitaireInteractionTests = function() {
   const pass10 = moved && undone;
   console.log(`[Test 10] Undo reverts previous move: ${pass10 ? 'PASS' : 'FAIL'}`);
   if (pass10) passed++;
+
+  // Test 11: Score increments on move and reverts on undo
+  const scoreBefore = score;
+  const aceC = deck.find(c => c.rank === 'A' && c.suit === 'clubs');
+  foundations.clubs = [];
+  tableau[0] = [aceC]; aceC.faceUp = true; aceC.location = { type: 'tableau', index: 0 };
+  onCardClicked(aceC);
+  handlePileClick({ type: 'foundation', suit: 'clubs' });
+  const scoreAfterMove = score;
+  const scoreIncreased = scoreAfterMove === scoreBefore + POINTS.MOVE_FOUNDATION;
+  undo();
+  const scoreReverted = score === scoreBefore;
+  const pass11 = scoreIncreased && scoreReverted;
+  console.log(`[Test 11] Score tracking & undo revert: ${pass11 ? 'PASS' : 'FAIL'}`);
+  if (pass11) passed++;
 
   console.log(`=== TEST SUMMARY: ${passed}/${total} PASSED ===`);
   dealNewGame();
