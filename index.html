@@ -107,10 +107,16 @@
             font-size: 12px;
         }
 
-        .new-game-btn {
+        .btn-group {
             pointer-events: auto;
+            display: flex;
+            gap: 12px;
             margin-bottom: 8px;
-            padding: 12px 28px;
+        }
+
+        .action-btn {
+            pointer-events: auto;
+            padding: 12px 24px;
             border: none;
             border-radius: 999px;
             background: var(--felt);
@@ -119,8 +125,18 @@
             font-weight: 600;
             letter-spacing: 0.02em;
             box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+            transition: background 0.2s ease, opacity 0.2s ease, transform 0.1s ease;
+            cursor: pointer;
         }
-        .new-game-btn:active { background: var(--felt-dark); }
+        .action-btn:active:not(:disabled) {
+            background: var(--felt-dark);
+            transform: scale(0.97);
+        }
+        .action-btn:disabled {
+            opacity: 0.40;
+            cursor: not-allowed;
+            box-shadow: none;
+        }
 
         .win-message {
             display: none;
@@ -206,7 +222,10 @@
         <div id="trackingIndicator" class="tracking-indicator tracking-searching">
             <span class="tracking-dot">○</span> <span class="tracking-text">Point camera at the card/target</span>
         </div>
-        <button id="newGameBtn" class="new-game-btn" type="button">New Game</button>
+        <div class="btn-group">
+            <button id="undoBtn" class="action-btn undo-btn" type="button" disabled>Undo</button>
+            <button id="newGameBtn" class="action-btn new-game-btn" type="button">New Game</button>
+        </div>
     </div>
 
     <div id="winMessage" class="win-message">

@@ -76,6 +76,7 @@ let waste = [];
 let foundations = { hearts: [], diamonds: [], clubs: [], spades: [] };
 
 let selected = null;
+const moveHistory = [];
 
 // Direct mapping from Three.js mesh.uuid -> Card object or Pile Slot
 const meshToCard = new Map();
@@ -225,6 +226,8 @@ function dealNewGame() {
   });
 
   setTimeout(validateAllCards, 50);
+  moveHistory.length = 0;
+  updateUndoButton();
 }
 
 function clearBoard() {
@@ -1003,6 +1006,7 @@ function onCardClicked(card) {
   // Otherwise cancels selection.
   if (selected.card === card) {
     if (isTopOfPile(card, pile) && pile.type !== 'foundation' && canPlaceOnFoundation(card, card.suit)) {
+      saveState();
       deselectCard();
       const destPile = { type: 'foundation', suit: card.suit, index: card.suit };
       moveCardsToPile([card], pile, destPile);
@@ -1071,6 +1075,7 @@ function attemptMove(sel, destPile) {
 
   console.log(`VALID: ${valid}`);
   if (valid) {
+    saveState();
     clearSelectionForMove(run);
     moveCardsToPile(run, srcPile, targetPile);
     selected = null;
@@ -1121,6 +1126,7 @@ function drawFromStock() {
 
   if (stock.length === 0) {
     if (waste.length === 0) return;
+    saveState();
     while (waste.length) {
       const c = waste.pop();
       c.faceUp = false;
@@ -1133,6 +1139,7 @@ function drawFromStock() {
     return;
   }
 
+  saveState();
   const card = stock.pop();
   card.faceUp = true;
   card.location = { type: 'waste' };
@@ -1141,6 +1148,106 @@ function drawFromStock() {
   renderBoard(false);
   const cardStr = `${card.rank}${SUIT_SYMBOLS[card.suit]}`;
   console.log(`STOCK: Drew ${cardStr}`);
+}
+
+// ----------------------------------------------------------------------------
+// 14B. UNDO SYSTEM
+// ----------------------------------------------------------------------------
+function saveState() {
+  const snapshot = {
+    tableau: tableau.map((col) => col.map((c) => ({ id: c.id, faceUp: c.faceUp }))),
+    stock: stock.map((c) => ({ id: c.id, faceUp: c.faceUp })),
+    waste: waste.map((c) => ({ id: c.id, faceUp: c.faceUp })),
+    foundations: {
+      hearts: foundations.hearts.map((c) => ({ id: c.id, faceUp: c.faceUp })),
+      diamonds: foundations.diamonds.map((c) => ({ id: c.id, faceUp: c.faceUp })),
+      clubs: foundations.clubs.map((c) => ({ id: c.id, faceUp: c.faceUp })),
+      spades: foundations.spades.map((c) => ({ id: c.id, faceUp: c.faceUp })),
+    },
+  };
+  moveHistory.push(snapshot);
+  updateUndoButton();
+}
+
+function updateUndoButton() {
+  const undoBtn = document.getElementById('undoBtn');
+  if (undoBtn) {
+    undoBtn.disabled = moveHistory.length === 0;
+  }
+}
+
+function undo() {
+  if (moveHistory.length === 0) return;
+  if (selected) deselectCard();
+
+  const prev = moveHistory.pop();
+  const cardMap = new Map();
+  deck.forEach((c) => cardMap.set(c.id, c));
+
+  tableau = prev.tableau.map((col, colIdx) =>
+    col.map((item) => {
+      const card = cardMap.get(item.id);
+      card.faceUp = item.faceUp;
+      card.location = { type: 'tableau', index: colIdx };
+      updateCardTexture(card);
+      return card;
+    })
+  );
+
+  stock = prev.stock.map((item) => {
+    const card = cardMap.get(item.id);
+    card.faceUp = item.faceUp;
+    card.location = { type: 'stock' };
+    updateCardTexture(card);
+    return card;
+  });
+
+  waste = prev.waste.map((item) => {
+    const card = cardMap.get(item.id);
+    card.faceUp = item.faceUp;
+    card.location = { type: 'waste' };
+    updateCardTexture(card);
+    return card;
+  });
+
+  foundations = {
+    hearts: prev.foundations.hearts.map((item) => {
+      const card = cardMap.get(item.id);
+      card.faceUp = item.faceUp;
+      card.location = { type: 'foundation', suit: 'hearts', index: 'hearts' };
+      updateCardTexture(card);
+      return card;
+    }),
+    diamonds: prev.foundations.diamonds.map((item) => {
+      const card = cardMap.get(item.id);
+      card.faceUp = item.faceUp;
+      card.location = { type: 'foundation', suit: 'diamonds', index: 'diamonds' };
+      updateCardTexture(card);
+      return card;
+    }),
+    clubs: prev.foundations.clubs.map((item) => {
+      const card = cardMap.get(item.id);
+      card.faceUp = item.faceUp;
+      card.location = { type: 'foundation', suit: 'clubs', index: 'clubs' };
+      updateCardTexture(card);
+      return card;
+    }),
+    spades: prev.foundations.spades.map((item) => {
+      const card = cardMap.get(item.id);
+      card.faceUp = item.faceUp;
+      card.location = { type: 'foundation', suit: 'spades', index: 'spades' };
+      updateCardTexture(card);
+      return card;
+    }),
+  };
+
+  const win = document.getElementById('winMessage');
+  if (win) win.style.display = 'none';
+
+  renderBoard(false);
+  updateUndoButton();
+  refreshDebugDisplay();
+  console.log(`UNDO: Restored previous state (${moveHistory.length} remaining in history)`);
 }
 
 // ----------------------------------------------------------------------------
@@ -1277,10 +1384,17 @@ function performRaycast(clientX, clientY) {
 }
 
 function setupManualRaycasting() {
+  function isInteractiveUI(target) {
+    return target && target.closest && (
+      target.closest('#newGameBtn') ||
+      target.closest('#undoBtn') ||
+      target.closest('.action-btn') ||
+      target.closest('#winMessage')
+    );
+  }
+
   function onTouchStart(e) {
-    if (e.target && e.target.closest && (e.target.closest('#newGameBtn') || e.target.closest('#winMessage'))) {
-      return;
-    }
+    if (isInteractiveUI(e.target)) return;
     if (e.touches && e.touches.length > 0) {
       tapStartPos = { x: e.touches[0].clientX, y: e.touches[0].clientY };
       tapStartTime = performance.now();
@@ -1289,7 +1403,7 @@ function setupManualRaycasting() {
 
   function onTouchEnd(e) {
     if (!tapStartPos) return;
-    if (e.target && e.target.closest && (e.target.closest('#newGameBtn') || e.target.closest('#winMessage'))) {
+    if (isInteractiveUI(e.target)) {
       tapStartPos = null;
       return;
     }
@@ -1320,9 +1434,7 @@ function setupManualRaycasting() {
   function onPointerDown(e) {
     if (e.pointerType === 'touch') return;
     if (e.isPrimary === false) return;
-    if (e.target && e.target.closest && (e.target.closest('#newGameBtn') || e.target.closest('#winMessage'))) {
-      return;
-    }
+    if (isInteractiveUI(e.target)) return;
     tapStartPos = { x: e.clientX, y: e.clientY };
     tapStartTime = performance.now();
   }
@@ -1330,7 +1442,7 @@ function setupManualRaycasting() {
   function onPointerUp(e) {
     if (e.pointerType === 'touch') return;
     if (e.isPrimary === false || !tapStartPos) return;
-    if (e.target && e.target.closest && (e.target.closest('#newGameBtn') || e.target.closest('#winMessage'))) {
+    if (isInteractiveUI(e.target)) {
       tapStartPos = null;
       return;
     }
@@ -1414,7 +1526,7 @@ function setupManualRaycasting() {
 window.runSolitaireInteractionTests = function() {
   console.log('=== STARTING CONTROLLED SOLITAIRE INTERACTION TESTS ===');
   let passed = 0;
-  const total = 9;
+  const total = 10;
 
   dealNewGame();
 
@@ -1521,6 +1633,17 @@ window.runSolitaireInteractionTests = function() {
   console.log(`[Test 9] Double-tap 'A' and onwards stacks to foundation: ${pass9 ? 'PASS' : 'FAIL'}`);
   if (pass9) passed++;
 
+  // Test 10: Undo button reverts move
+  const stockBeforeUndo = stock.length;
+  const wasteBeforeUndo = waste.length;
+  drawFromStock();
+  const moved = stock.length === stockBeforeUndo - 1 && waste.length === wasteBeforeUndo + 1;
+  undo();
+  const undone = stock.length === stockBeforeUndo && waste.length === wasteBeforeUndo;
+  const pass10 = moved && undone;
+  console.log(`[Test 10] Undo reverts previous move: ${pass10 ? 'PASS' : 'FAIL'}`);
+  if (pass10) passed++;
+
   console.log(`=== TEST SUMMARY: ${passed}/${total} PASSED ===`);
   dealNewGame();
   return passed === total;
@@ -1534,7 +1657,10 @@ function init() {
   setupManualRaycasting();
   const newGameBtn = document.getElementById('newGameBtn');
   if (newGameBtn) newGameBtn.addEventListener('click', dealNewGame);
+  const undoBtn = document.getElementById('undoBtn');
+  if (undoBtn) undoBtn.addEventListener('click', undo);
   window.dealNewGame = dealNewGame;
+  window.undo = undo;
 
   // 1. Preload all 53 textures (52 card faces + 1 card back) upfront
   preloadAllTextures();
